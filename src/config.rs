@@ -132,6 +132,10 @@ fn codex_config_path() -> PathBuf {
     codex_home().join("config.toml")
 }
 
+fn codex_backup_config_path() -> PathBuf {
+    codex_home().join("config.toml.codex-proxy-backup")
+}
+
 fn codex_auth_path() -> PathBuf {
     codex_home().join("auth.json")
 }
@@ -156,6 +160,16 @@ fn claude_settings_path() -> PathBuf {
         return legacy;
     }
     settings
+}
+
+fn claude_settings_backup_path() -> PathBuf {
+    let mut path = claude_settings_path();
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "settings.json".to_string());
+    path.set_file_name(format!("{file_name}.codex-helper-backup"));
+    path
 }
 
 /// Directory where Codex stores conversation sessions: `~/.codex/sessions` (or `$CODEX_HOME/sessions`).
@@ -194,8 +208,15 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
         return Ok(());
     }
 
+    // 优先从备份配置中推导原始上游，避免在 ~/.codex/config.toml 已被 codex-helper
+    // 写成本地 provider（codex_proxy）时出现“自我转发”。
+    let backup_path = codex_backup_config_path();
     let cfg_path = codex_config_path();
-    let cfg_text_opt = read_file_if_exists(&cfg_path)?;
+    let cfg_text_opt = if let Some(text) = read_file_if_exists(&backup_path)? {
+        Some(text)
+    } else {
+        read_file_if_exists(&cfg_path)?
+    };
     let cfg_text = match cfg_text_opt {
         Some(s) if !s.trim().is_empty() => s,
         _ => {
@@ -222,6 +243,22 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
         .unwrap_or_default();
 
     let provider_table = providers_table.get(&provider_id);
+
+    // 如当前 provider 看起来是本地 codex-helper 代理且没有备份（或备份无效），
+    // 则无法安全推导原始上游，直接报错，避免将代理指向自身。
+    if provider_id == "codex_proxy" && !backup_path.exists() {
+        let is_local_helper = provider_table
+            .and_then(|t| t.get("base_url"))
+            .and_then(|v| v.as_str())
+            .map(|u| u.contains("127.0.0.1") || u.contains("localhost"))
+            .unwrap_or(false);
+        if is_local_helper {
+            anyhow::bail!(
+                "检测到 ~/.codex/config.toml 的当前 model_provider 指向本地代理 codex-helper，且未找到备份配置；\
+无法自动推导原始 Codex 上游。请先恢复 ~/.codex/config.toml 后重试，或在 ~/.codex-proxy/config.json 中手动添加 codex 上游配置。"
+            );
+        }
+    }
 
     let base_url = provider_table
         .and_then(|t| t.get("base_url"))
@@ -297,7 +334,13 @@ fn bootstrap_from_claude(cfg: &mut ProxyConfig) -> Result<()> {
     }
 
     let settings_path = claude_settings_path();
-    let settings_text_opt = read_file_if_exists(&settings_path)?;
+    let backup_path = claude_settings_backup_path();
+    // Claude 配置同样优先从备份读取，避免将代理指向自身（本地 codex-helper）。
+    let settings_text_opt = if let Some(text) = read_file_if_exists(&backup_path)? {
+        Some(text)
+    } else {
+        read_file_if_exists(&settings_path)?
+    };
     let settings_text = match settings_text_opt {
         Some(s) if !s.trim().is_empty() => s,
         _ => {
@@ -335,6 +378,18 @@ fn bootstrap_from_claude(cfg: &mut ProxyConfig) -> Result<()> {
         .and_then(|v| v.as_str())
         .unwrap_or("https://api.anthropic.com/v1")
         .to_string();
+
+    // 如当前 base_url 看起来是本地地址且没有备份，则无法安全推导真实上游，
+    // 直接报错，避免将 Claude 代理指向自身。
+    if !backup_path.exists()
+        && (base_url.contains("127.0.0.1") || base_url.contains("localhost"))
+    {
+        anyhow::bail!(
+            "检测到 Claude settings {:?} 的 ANTHROPIC_BASE_URL 指向本地地址 ({base_url})，且未找到备份配置；\
+无法自动推导原始 Claude 上游。请先恢复 Claude 配置后重试，或在 ~/.codex-proxy/config.json 中手动添加 claude 上游配置。",
+            settings_path
+        );
+    }
 
     let mut tags = HashMap::new();
     tags.insert("source".into(), "claude-settings".into());
