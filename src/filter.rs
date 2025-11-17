@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use anyhow::Result;
 use regex::bytes::Regex;
 use serde::Deserialize;
 
@@ -59,11 +58,7 @@ impl RequestFilter {
     fn reload_if_needed(&self, inner: &mut Inner) {
         let now = SystemTime::now();
         if let Some(last) = inner.last_check {
-            if now
-                .duration_since(last)
-                .unwrap_or_default()
-                < self.check_interval
-            {
+            if now.duration_since(last).unwrap_or_default() < self.check_interval {
                 return;
             }
         }
@@ -180,4 +175,3 @@ impl RequestFilter {
         buf
     }
 }
-

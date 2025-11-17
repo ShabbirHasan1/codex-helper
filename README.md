@@ -1,130 +1,214 @@
-# codex-proxy（Codex CLI 本地代理）
+# codex-helper（Codex CLI 本地助手 / 本地代理）
 
-> 基于 Rust 的 Codex 本地代理，支持多上游配置、失败熔断、用量驱动的自动切换、请求过滤和用量统计。设计灵感来自 [cli_proxy](https://github.com/guojinpeng/cli_proxy) 和 [cc-switch](https://github.com/farion1231/cc-switch)，但专门面向 Codex CLI。
+> 基于 Rust 的 Codex 本地助手 / 本地代理，专门为 Codex CLI 设计。  
+> 帮你在本地统一管理 **多供应商 / 多 key / 多端点**，在额度用完或失败时自动切换，并提供便捷的会话工具。
 
-## 功能概览
+> English version: [README_EN.md](README_EN.md)
 
-- **Codex 无感接入**
-  - 一条命令将 Codex 的 `model_provider` 切到本地代理：`codex-proxy switch-on`。
-  - 自动备份 `~/.codex/config.toml`，可通过 `switch-off` 一键恢复。
-  - 自动从 `~/.codex` 读取当前 `model_provider` 与 token，生成初始上游配置。
+## 你可以用 codex-helper 做什么？
 
-- **多配置 / 号池管理**
-  - 上游配置保存在 `~/.codex-proxy/config.json`。
-  - 支持为每个 Codex 配置设置别名（alias），以及多个 upstream（号池）。
-  - 提供 `config list/add/set-active` 命令，方便切换不同环境/中转站。
+- **一键让 Codex 走本地代理**
+  - `codex-helper switch-on` 一次切换，Codex CLI 所有请求都经过本地代理；
+  - 自动备份 `~/.codex/config.toml`，用 `switch-off` 随时恢复。
 
-- **负载均衡与失败熔断**
-  - 按权重进行上游选择（Weighted Random）。
-  - 每个 upstream 维护连续失败计数：
-    - 连续失败达到阈值（默认 3 次）会进入冷却期（默认 30 秒）。
-    - 冷却期内不再调度该 upstream，期满后自动恢复。
+- **集中管理多个 key / 供应商 / 中转站**
+  - 在 `~/.codex-proxy/config.json` 里维护多套 Codex 配置（openai / packy / 自建中转等）；
+  - 每套配置下可以挂多个 upstream（号池），按顺序作为 primary/backup。
 
-- **用量驱动“用完自动切换”（统一状态）**
-  - 引入“用量提供商（usage providers）”的概念，统一管理不同供应商的额度信息。
-  - 当前默认支持 **packycode**（以配置形式存在，LB 中不写死品牌名）：
-    - 默认生成 `~/.codex-proxy/usage_providers.json`，包含一个 `packycode` provider。
-    - 按域名匹配 upstream（如 host 包含 `packycode.com`）并归属到该 provider。
-    - 使用当前 Codex 上游的 token（或可选 env）去调用 packy 的预算接口。
-    - 当检测到月度额度用完时，会把对应 upstream 标记为 “用量已用尽”（`usage_exhausted = true`）。
-  - 负载均衡策略：
-    - 正常情况下：优先在 **未用尽** 且 **未熔断** 的 upstream 中按权重选择。
-    - 若全部 upstream 都标记为用量用尽：忽略“用尽”标记，仅保留失败熔断规则再挑选——保证永远有兜底。
+- **用量“用完自动切换”**
+  - 内置 usage provider 机制（默认适配 packy）：
+    - 定期或按需查询额度；
+    - 当检测到某个供应商额度用尽时，自动把对应 upstream 标记为“用尽”，优先走其他线路；
+    - 所有线路都用尽时仍然会兜底选一个，不会彻底断流。
 
-- **请求过滤（敏感信息脱敏）**
-  - 支持从 `~/.codex-proxy/filter.json` 读取过滤规则：
-    - 规则格式与思路参考 [cli_proxy](https://github.com/guojinpeng/cli_proxy)，支持：
-      - `{"op": "replace", "source": "...", "target": "..."}`  
-      - `{"op": "remove",  "source": "..."}`。
-    - 支持数组或单对象。
-  - 每次请求在发送到上游前，对 body 进行字节级过滤，避免敏感数据直接发出。
+- **命令行下快速找回会话**
+  - `codex-helper session list`：按“当前项目（cwd/父目录/子目录）”智能列出最近的 Codex 会话；
+  - `codex-helper session last`：直接给出“当前项目最后一次会话”以及对应的 `codex resume <ID>` 命令。
 
-- **用量统计与请求日志**
-  - 对 Codex 发出的非流式响应请求：
-    - 尝试从返回 JSON 的 `usage` 或 `response.usage` 中抽取 `input/output/reasoning/total_tokens`。
-  - 对流式 SSE 响应：
-    - 观察 SSE 流中的 `data:` 事件，解析其中的 JSON usage 字段，记录最后一次 usage。
-  - 所有请求都会写入 `~/.codex-proxy/logs/requests.jsonl`，内容包括：
-    - 时间戳、方法、路径、状态码、耗时、配置名、上游 base_url、usage（如解析到）。
+- **统一的请求过滤与日志**
+  - 在 `filter.json` 配好敏感信息替换 / 删除规则，所有 Codex 请求发出前统一脱敏；
+  - 请求日志统一写到 `~/.codex-proxy/logs/requests.jsonl`，便于用 `jq` 等工具做用量分析和排障。
 
-## 安装与运行
+- **（实验性）Claude Code 支持**
+  - 基于 `~/.claude/settings.json` 自动引导 Claude 上游配置；
+  - 支持 `codex-helper switch-on --claude` / `serve --claude` 将 Claude Code 指向本地代理，并带备份与 Guard；
+  - 由于 Claude 自身更新节奏较快，这部分行为暂时视为实验特性。
 
-### 1. 构建二进制
+## 快速开始
 
-在项目根目录执行：
+### 1. 构建与安装
 
 ```bash
 cargo build --release
 ```
 
-生成的可执行文件位于：
+生成的可执行文件：
 
 ```bash
-target/release/codex-proxy
+target/release/codex-helper
 ```
 
-建议将其加入 `PATH`，方便直接使用 `codex-proxy` 命令。
+将其加入 `PATH`，即可直接运行 `codex-helper`。
 
 ### 2. 一次性让 Codex 使用本地代理
 
-执行：
-
 ```bash
-codex-proxy switch-on
+codex-helper switch-on
 ```
 
-- 该命令会：
-  - 读取 `~/.codex/config.toml`。
-  - 备份为 `~/.codex/config.toml.codex-proxy-backup`（如尚未备份）。
-  - 在 `[model_providers]` 中写入：
+- 读取 `~/.codex/config.toml`；
+- 如尚未备份，则复制为 `~/.codex/config.toml.codex-proxy-backup`；
+- 写入/覆盖下列配置，并将 `model_provider` 指向它：
 
-    ```toml
-    [model_providers.codex_proxy]
-    name = "codex-proxy"
-    base_url = "http://127.0.0.1:3211"
-    wire_api = "responses"
+  ```toml
+  [model_providers.codex_proxy]
+  name = "codex-helper"
+  base_url = "http://127.0.0.1:3211"
+  wire_api = "responses"
 
-    model_provider = "codex_proxy"
-    ```
+  model_provider = "codex_proxy"
+  ```
 
-  - 如需自定义端口，可使用 `codex-proxy switch-on --port <PORT>`。
+- 自定义端口：
+
+  ```bash
+  codex-helper switch-on --port 4000
+  ```
 
 恢复原始 Codex 配置：
 
 ```bash
-codex-proxy switch-off
+codex-helper switch-off
 ```
 
-### 3. 启动 proxy 服务
+### 3. 启动代理服务
+
+Codex 代理（默认 3211）：
 
 ```bash
-codex-proxy serve
-```
-
-或指定端口：
-
-```bash
-codex-proxy serve --port 3211
+codex-helper serve
+codex-helper serve --port 3211
 ```
 
 服务启动后：
 
-- 监听 `127.0.0.1:<port>`，接受 Codex CLI 发出的 HTTP 请求（包括流式与非流式），并按配置转发至上游。
-- 首次运行时，会从 `~/.codex/config.toml` 与 `~/.codex/auth.json` 自动生成一条默认上游配置：
-  - 使用当前 `model_provider`。
-  - 使用其 `env_key` / `auth.json` 中的 token 作为上游 `auth_token`。
+- 监听 `127.0.0.1:<port>`；
+- Codex 模式下，首次运行会尝试从 `~/.codex/config.toml` 与 `~/.codex/auth.json` 推导默认上游：
+  - 使用当前 `model_provider`；
+  - 使用其 `env_key` / `auth.json` 中的 token 作为上游 `auth_token`；
+- 如无法解析到有效 token，会直接报错退出（fail-fast），避免“默默每次 401/403”的情况。
 
-## 配置与号池管理
+### 4. 智能 session 辅助（Codex）
+
+查看当前项目相关的最近会话：
+
+```bash
+codex-helper session list
+codex-helper session list --limit 20
+```
+
+- 会从 `~/.codex/sessions/**/rollout-*.jsonl` 中读取会话；
+- 优先匹配当前目录 / 父目录 / 子目录的 `cwd`；
+- 每条会话展示：
+  - `id`：完整会话 ID，单独一行方便复制；
+  - `updated`：最后更新时间；
+  - `cwd`：会话所属工作目录；
+  - `prompt`：首条用户消息的简短预览（截断到 80 字符）。
+
+快速定位“当前项目最近一次会话”并给出 resume 命令：
+
+```bash
+codex-helper session last
+```
+
+示例输出：
+
+```text
+Last Codex session for current project:
+  id: 1234-...-abcd
+  updated_at: 2025-04-01T10:30:00Z
+  cwd: /Users/you/project
+  first_prompt: 你的第一条消息...
+
+Resume with:
+  codex resume 1234-...-abcd
+```
+
+你也可以针对任意目录查询会话（而不必 cd 进去）：
+
+```bash
+codex-helper session list --path ~/code/my-app
+codex-helper session last --path ~/code/my-app
+```
+
+## 典型工作流示例
+
+### 1. 多供应商 / 多 key 集中管理 + 快速切换
+
+假设你有多家供应商/代理（OpenAI 官方、Packy 中转、自建代理等），希望在本地统一管理并在需要时一条命令切换：
+
+```bash
+# 1. 为不同供应商添加配置
+codex-helper config add openai-main \
+  --base-url https://api.openai.com/v1 \
+  --auth-token sk-openai-xxx \
+  --alias "OpenAI 主额度"
+
+codex-helper config add packy-main \
+  --base-url https://codex-api.packycode.com/v1 \
+  --auth-token sk-packy-yyy \
+  --alias "Packy 中转"
+
+codex-helper config list
+
+# 2. 全局选择当前使用的供应商（active 配置）
+codex-helper config set-active openai-main   # 使用 OpenAI
+# 或者
+codex-helper config set-active packy-main    # 使用 Packy
+
+# 3. 一次性让 Codex 使用本地代理（只需执行一次）
+codex-helper switch-on
+
+# 4. 在当前 active 配置下启动代理
+codex-helper serve
+```
+
+对于大部分“有很多 key / 代理”的用户，这样就可以在一个 JSON + 少量命令中集中管理所有上游，并按需快速切换。
+
+### 2. 按项目快速恢复 Codex 会话
+
+当你回到某个项目目录，希望快速恢复之前的 Codex 会话，可以这样使用：
+
+```bash
+cd ~/code/my-app
+
+# 列出当前项目相关的最近会话
+codex-helper session list
+
+# 找到“当前项目”最近一次会话并给出 resume 命令
+codex-helper session last
+```
+
+你也可以从任意位置查询指定项目的会话：
+
+```bash
+codex-helper session list --path ~/code/my-app
+codex-helper session last --path ~/code/my-app
+```
+
+这在你有多个 side project 时尤其方便：不需要记忆 session ID，只要告诉 codex-helper 你关心的目录，它就会优先匹配该目录及其父/子目录下的会话，并给出 `codex resume <ID>` 命令。
+
+## 配置文件与命令
 
 ### 配置文件位置
 
 - 主配置：`~/.codex-proxy/config.json`
-  - 包含 `codex` 与未来的 `claude` 配置。
-- 请求过滤规则：`~/.codex-proxy/filter.json`
-- 用量提供商配置：`~/.codex-proxy/usage_providers.json`
+  - `codex`：Codex 上游配置。
+- 请求过滤：`~/.codex-proxy/filter.json`
+- 用量提供商：`~/.codex-proxy/usage_providers.json`
 - 请求日志：`~/.codex-proxy/logs/requests.jsonl`
 
-### `config.json` 结构（简要）
+### `config.json` 示例
 
 ```jsonc
 {
@@ -137,7 +221,6 @@ codex-proxy serve --port 3211
         "upstreams": [
           {
             "base_url": "https://api.openai.com/v1",
-            "weight": 1.0,
             "auth": {
               "auth_token": "sk-...",
               "api_key": null
@@ -150,59 +233,45 @@ codex-proxy serve --port 3211
         ]
       }
     }
-  },
-  "claude": {
-    "active": null,
-    "configs": {}
   }
 }
 ```
 
-- `name`：配置 ID，作为内部标识。
-- `alias`：可选别名（用于展示）。
-- `upstreams`：上游池：
-  - `base_url`：上游 API 地址（不含 `/v1/responses` 路径）。
-  - `weight`：该 upstream 的权重。
-  - `auth.auth_token`：用于 `Authorization: Bearer <token>`。
-  - `tags`：可选标签，便于标记来源。
+- `name`：配置 ID（也是 `configs` 的 key）。
+- `alias`：可选展示名称。
+- `upstreams`：上游池（顺序 = 优先级）：
+  - `base_url`：上游 API 地址；
+  - `auth.auth_token`：用于 `Authorization: Bearer <token>`；
+  - `auth.api_key`：可选，用于某些 `x-api-key` 风格鉴权；
+  - `tags`：任意键值对，便于标记来源等元信息。
 
-### CLI 管理命令
+### 配置管理命令
 
-列出所有 Codex 配置：
-
-```bash
-codex-proxy config list
-```
-
-输出示例：
-
-```text
-Codex configs:
-  * openai-main [主 OpenAI 额度] (1 upstreams)
-    backup-proxy (2 upstreams)
-```
-
-新增一条配置：
+列出配置：
 
 ```bash
-codex-proxy config add my-proxy \
-  --base-url https://your-proxy.example.com/v1 \
+codex-helper config list
+```
+
+新增配置：
+
+```bash
+# Codex
+codex-helper config add openai-main \
+  --base-url https://api.openai.com/v1 \
   --auth-token sk-xxx \
-  --weight 1.0 \
-  --alias "自建中转"
+  --alias "主 OpenAI 额度"
 ```
 
-切换当前激活配置：
+切换激活配置：
 
 ```bash
-codex-proxy config set-active my-proxy
+codex-helper config set-active openai-main
 ```
 
 ## 用量提供商（Usage Providers）
 
-### 配置结构
-
-文件：`~/.codex-proxy/usage_providers.json`，首次运行会生成默认内容，如：
+配置文件：`~/.codex-proxy/usage_providers.json`，示例：
 
 ```jsonc
 {
@@ -219,63 +288,36 @@ codex-proxy config set-active my-proxy
 }
 ```
 
-字段说明：
+- `domains`：只要 upstream 的 `base_url` host 匹配这些域名，即视为属于该 provider；
+- `endpoint`：用量查询 API 地址；
+- `token_env`：如设置且环境变量非空，则优先使用该值作为 Bearer token；
+- 否则，从关联的 upstream 中取第一个非空的 `auth.auth_token`。
 
-- `id`：提供商 ID，仅用于日志与区分。
-- `kind`：类型，目前支持 `budget_http_json`（预算类用量接口）。
-- `domains`：域名列表，当 upstream 的 `base_url` 所在 host 匹配这些域名时，会归属到该 provider。
-- `endpoint`：用量查询 API 地址。
-- `token_env`：可选的环境变量名，如果设置则优先从该 env 读取 token。
-- `poll_interval_secs`：轮询间隔（秒），默认 60。
+对于 `budget_http_json`：
 
-### Token 选择策略
-
-对于每个 provider：
-
-1. 若配置了 `token_env` 且对应环境变量存在且非空，则使用该值。
-2. 否则，从归属该 provider 的 upstream 中，取第一个非空的 `auth.auth_token` 用作 Bearer token。
-
-这意味着对于 packy 这种“一般就是一个 token” 的场景：
-
-- Codex 使用哪个 token 调用 packy upstream，我们就默认用同一个 token 去查 packy 的额度。
-
-### 用量与 LB 的联动
-
-- 当用量接口返回的 JSON 中：
-  - `monthly_budget_usd > 0` 且 `monthly_spent_usd >= monthly_budget_usd` 时，认为“本月额度用尽”。
-- 对于该 provider 管理的所有 upstream：
-  - 在 LB 状态中设置 `usage_exhausted = true`。
-- 负载均衡行为：
-  - 只要还有其他未用尽且未熔断的 upstream，就不会再分流到这些“用尽”节点。
-  - 如果所有 upstream 都被标记为 `usage_exhausted = true`：
-    - LB 会在兜底路径中忽略“用尽”标记，仅根据失败熔断规则再选一个可用节点，保证不会彻底断流。
+- 用量接口返回的 JSON 中：
+  - 读取 `monthly_budget_usd` 与 `monthly_spent_usd`；
+  - 若 `monthly_budget_usd > 0` 且 `monthly_spent_usd >= monthly_budget_usd`，视为额度用尽；
+- 对应 upstream 在 LB 状态中被标记为 `usage_exhausted = true`；
+- LB 会尽量避开这些 upstream；若所有 upstream 都用尽，则忽略“用尽”标记，仅按失败熔断规则兜底。
 
 ## 请求过滤与日志
 
 ### 请求过滤：`~/.codex-proxy/filter.json`
 
-示例：
-
 ```jsonc
 [
-  {
-    "op": "replace",
-    "source": "your-company.com",
-    "target": "[REDACTED_DOMAIN]"
-  },
-  {
-    "op": "remove",
-    "source": "super-secret-token"
-  }
+  { "op": "replace", "source": "your-company.com", "target": "[REDACTED_DOMAIN]" },
+  { "op": "remove",  "source": "super-secret-token" }
 ]
 ```
 
-- 代理在将请求 body 发往上游前，会按规则进行字节级替换/删除。
-- 过滤规则会缓存，并在文件修改（mtime 变化）后自动重新加载（约 1 秒内生效）。
+- 在转发到上游前，对请求 body 做字节级替换 / 删除；
+- 过滤规则缓存在内存中，但会根据文件 mtime 约 1 秒内自动刷新。
 
 ### 请求日志：`~/.codex-proxy/logs/requests.jsonl`
 
-每行是一个 JSON 对象，类似：
+每行是一个 JSON 对象，例如：
 
 ```jsonc
 {
@@ -298,12 +340,17 @@ codex-proxy config set-active my-proxy
 
 你可以用 `jq` 等工具按配置名 / 上游 / 时间窗口做用量分析或问题排查。
 
-- 本项目参考并借鉴了以下开源项目的设计与经验：
-  - [cli_proxy](https://github.com/guojinpeng/cli_proxy)：本地多服务代理，支持 UI、过滤、模型路由、号池等。
-  - [cc-switch](https://github.com/farion1231/cc-switch)：多供应商配置与切换、Codex/Claude 配置文件的安全读写与同步。
-- 我们的定位：
-  - 更专注于 **Codex CLI responses wire_api 的本地代理** 和 **命令行/配置驱动的多上游管理**；
-  - 默认无 UI，便于在本地环境或服务器上以轻量方式部署；
-  - 在架构上预留了未来扩展 Claude Code 等服务的能力。
+## 与 cli_proxy / cc-switch 的关系
 
-如果你已经熟悉 `cli_proxy` 和 `cc-switch`，可以把本项目看作一个更轻量、更 Rust 化、专门为 Codex CLI 优化的“本地代理 + 配置/用量中枢”。在使用时，你也可以同时保留/配合这些工具，根据自己的工作流选择合适的组合。 
+- [cli_proxy](https://github.com/guojinpeng/cli_proxy)：多服务本地代理，提供 Web UI、模型路由、过滤、号池等高级能力。
+- [cc-switch](https://github.com/farion1231/cc-switch)：桌面级配置管理与切换工具，负责 Codex 等 CLI 配置的安全读写与同步。
+
+codex-helper 的定位：
+
+- 更专注于 **Codex CLI responses wire_api 的本地代理** 和 **命令行 / 配置驱动的多上游管理**；
+- 默认无 UI，适合在本地或服务器以轻量方式部署。
+
+如果你已经熟悉 `cli_proxy` 和 `cc-switch`，可以把 codex-helper 看作一个更轻量、更 Rust 化、专门为 Codex CLI 优化的“本地代理 + 配置/用量中枢”。在实际使用中也可以与它们配合：  
+- 用 cc-switch 管理系统级 Codex 配置；  
+- 用 codex-helper 管理本地代理与上游池；  
+- 用 cli_proxy 作为更重型的带 UI 管控层。 

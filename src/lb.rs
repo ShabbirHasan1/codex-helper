@@ -1,9 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use rand::distributions::WeightedIndex;
-use rand::prelude::*;
-
 use crate::config::{ServiceConfig, UpstreamConfig};
 
 const FAILURE_THRESHOLD: u32 = 3;
@@ -51,10 +48,7 @@ impl LoadBalancer {
             return None;
         }
 
-        let mut map = self
-            .states
-            .lock()
-            .expect("lb state mutex poisoned");
+        let mut map = self.states.lock().expect("lb state mutex poisoned");
         let entry = map
             .entry(self.service.name.clone())
             .or_insert_with(LbState::default);
@@ -62,85 +56,66 @@ impl LoadBalancer {
 
         let now = std::time::Instant::now();
 
-        // First pass: respect both failure/cooldown and usage_exhausted
-        let weights: Vec<f64> = self
+        // 更新冷却状态：如果冷却期已过，重置失败计数和冷却时间。
+        for idx in 0..self.service.upstreams.len() {
+            if let Some(until) = entry.cooldown_until.get(idx).and_then(|v| *v) {
+                if now >= until {
+                    entry.failure_counts[idx] = 0;
+                    if let Some(slot) = entry.cooldown_until.get_mut(idx) {
+                        *slot = None;
+                    }
+                }
+            }
+        }
+
+        // 第一轮：按顺序选择第一个「未熔断 + 未标记用量用尽」的 upstream。
+        if let Some(idx) = self
             .service
             .upstreams
             .iter()
             .enumerate()
-            .map(|(idx, u)| {
-                if let Some(until) = entry.cooldown_until.get(idx).and_then(|v| *v) {
-                    if now >= until {
-                        entry.failure_counts[idx] = 0;
-                        if let Some(slot) = entry.cooldown_until.get_mut(idx) {
-                            *slot = None;
-                        }
-                    }
-                }
-
+            .find_map(|(idx, _)| {
                 if entry.failure_counts[idx] >= FAILURE_THRESHOLD {
-                    0.0
-                } else if entry
-                    .usage_exhausted
-                    .get(idx)
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    0.0
-                } else if u.weight > 0.0 {
-                    u.weight
+                    return None;
+                }
+                if entry.usage_exhausted.get(idx).copied().unwrap_or(false) {
+                    return None;
+                }
+                Some(idx)
+            })
+        {
+            let upstream = self.service.upstreams[idx].clone();
+            return Some(SelectedUpstream {
+                config_name: self.service.name.clone(),
+                index: idx,
+                upstream,
+            });
+        }
+
+        // 第二轮：忽略 usage_exhausted，只看失败阈值，仍然按顺序选第一个。
+        if let Some(idx) = self
+            .service
+            .upstreams
+            .iter()
+            .enumerate()
+            .find_map(|(idx, _)| {
+                if entry.failure_counts[idx] >= FAILURE_THRESHOLD {
+                    None
                 } else {
-                    1.0
+                    Some(idx)
                 }
             })
-            .collect();
+        {
+            let upstream = self.service.upstreams[idx].clone();
+            return Some(SelectedUpstream {
+                config_name: self.service.name.clone(),
+                index: idx,
+                upstream,
+            });
+        }
 
-        let total_weight: f64 = weights.iter().sum();
-        let idx = if total_weight > 0.0 {
-            let dist = WeightedIndex::new(&weights).ok();
-            match dist {
-                Some(d) => {
-                    let mut rng = thread_rng();
-                    d.sample(&mut rng)
-                }
-                None => weights
-                    .iter()
-                    .enumerate()
-                    .find(|(_, w)| **w > 0.0)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0),
-            }
-        } else {
-            // Fallback: ignore usage_exhausted, only respect failure/cooldown
-            let fallback_weights: Vec<f64> = self
-                .service
-                .upstreams
-                .iter()
-                .enumerate()
-                .map(|(idx, u)| {
-                    if entry.failure_counts[idx] >= FAILURE_THRESHOLD {
-                        0.0
-                    } else if u.weight > 0.0 {
-                        u.weight
-                    } else {
-                        1.0
-                    }
-                })
-                .collect();
-            let dist = WeightedIndex::new(&fallback_weights).ok();
-            match dist {
-                Some(d) => {
-                    let mut rng = thread_rng();
-                    d.sample(&mut rng)
-                }
-                None => fallback_weights
-                    .iter()
-                    .enumerate()
-                    .find(|(_, w)| **w > 0.0)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0),
-            }
-        };
+        // 兜底：所有 upstream 都已达到失败阈值时，仍然返回第一个，以保证永远有兜底。
+        let idx = 0;
         let upstream = self.service.upstreams[idx].clone();
         Some(SelectedUpstream {
             config_name: self.service.name.clone(),
@@ -170,7 +145,9 @@ impl LoadBalancer {
             entry.failure_counts[index] = entry.failure_counts[index].saturating_add(1);
             if entry.failure_counts[index] >= FAILURE_THRESHOLD {
                 if let Some(slot) = entry.cooldown_until.get_mut(index) {
-                    *slot = Some(std::time::Instant::now() + std::time::Duration::from_secs(COOLDOWN_SECS));
+                    *slot = Some(
+                        std::time::Instant::now() + std::time::Duration::from_secs(COOLDOWN_SECS),
+                    );
                 }
             }
         }

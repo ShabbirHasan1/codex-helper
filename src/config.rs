@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use toml::Value as TomlValue;
 use tokio::fs;
+use toml::Value as TomlValue;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -24,8 +24,6 @@ pub struct UpstreamAuth {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpstreamConfig {
     pub base_url: String,
-    #[serde(default)]
-    pub weight: f64,
     #[serde(default)]
     pub auth: UpstreamAuth,
     /// Optional free-form metadata, e.g. region / label
@@ -138,12 +136,38 @@ fn codex_auth_path() -> PathBuf {
     codex_home().join("auth.json")
 }
 
+fn claude_home() -> PathBuf {
+    if let Ok(dir) = env::var("CLAUDE_HOME") {
+        return PathBuf::from(dir);
+    }
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".claude")
+}
+
+fn claude_settings_path() -> PathBuf {
+    let dir = claude_home();
+    let settings = dir.join("settings.json");
+    if settings.exists() {
+        return settings;
+    }
+    let legacy = dir.join("claude.json");
+    if legacy.exists() {
+        return legacy;
+    }
+    settings
+}
+
+/// Directory where Codex stores conversation sessions: `~/.codex/sessions` (or `$CODEX_HOME/sessions`).
+pub fn codex_sessions_dir() -> PathBuf {
+    codex_home().join("sessions")
+}
+
 fn read_file_if_exists(path: &Path) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
     }
-    let s = stdfs::read_to_string(path)
-        .with_context(|| format!("failed to read {:?}", path))?;
+    let s = stdfs::read_to_string(path).with_context(|| format!("failed to read {:?}", path))?;
     Ok(Some(s))
 }
 
@@ -175,9 +199,7 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
     let cfg_text = match cfg_text_opt {
         Some(s) if !s.trim().is_empty() => s,
         _ => {
-            anyhow::bail!(
-                "未找到 ~/.codex/config.toml 或文件为空，无法自动推导 Codex 上游"
-            );
+            anyhow::bail!("未找到 ~/.codex/config.toml 或文件为空，无法自动推导 Codex 上游");
         }
     };
 
@@ -231,13 +253,13 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
 
     if auth_token.is_none() {
         if let Some(key) = env_key.as_deref() {
-            warn!(
-                "未在环境变量或 ~/.codex/auth.json 中找到 `{}`, 将以无 Authorization 头的方式转发请求；上游可能返回 401/403",
+            anyhow::bail!(
+                "未在环境变量或 ~/.codex/auth.json 中找到 `{}`，无法为 Codex 上游构建有效的 Authorization 头；请先在 Codex CLI 中完成登录或配置对应环境变量，然后重试",
                 key
             );
         } else {
-            warn!(
-                "当前 model_provider 未声明 env_key，且无法从 ~/.codex/auth.json 推断唯一的 token，将以无 Authorization 头的方式转发请求；如需鉴权请在 ~/.codex-proxy/config.json 中手动添加 auth_token"
+            anyhow::bail!(
+                "当前 model_provider 未声明 env_key，且无法从 ~/.codex/auth.json 推断唯一的 token；请在 Codex CLI 中完成登录，或手动在 ~/.codex/config.toml 中为当前 provider 配置 env_key，并在环境变量或 ~/.codex/auth.json 中提供对应的 token"
             );
         }
     } else {
@@ -250,7 +272,6 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
 
     let upstream = UpstreamConfig {
         base_url,
-        weight: 1.0,
         auth: UpstreamAuth {
             auth_token,
             api_key: None,
@@ -266,6 +287,76 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
 
     cfg.codex.configs.insert(provider_id.clone(), service);
     cfg.codex.active = Some(provider_id);
+
+    Ok(())
+}
+
+fn bootstrap_from_claude(cfg: &mut ProxyConfig) -> Result<()> {
+    if !cfg.claude.configs.is_empty() {
+        return Ok(());
+    }
+
+    let settings_path = claude_settings_path();
+    let settings_text_opt = read_file_if_exists(&settings_path)?;
+    let settings_text = match settings_text_opt {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => {
+            anyhow::bail!(
+                "未找到 Claude Code 配置文件 {:?}（或文件为空），无法自动推导 Claude 上游；请先在 Claude Code 中完成配置，或手动在 ~/.codex-proxy/config.json 中添加 claude 配置",
+                settings_path
+            );
+        }
+    };
+
+    let value: JsonValue = serde_json::from_str(&settings_text)
+        .with_context(|| format!("解析 {:?} 失败，需为有效的 JSON", settings_path))?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Claude settings 根节点必须是 JSON object"))?;
+
+    let env_obj = obj
+        .get("env")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| anyhow::anyhow!("Claude settings 中缺少 env 对象"))?;
+
+    let api_key = env_obj
+        .get("ANTHROPIC_AUTH_TOKEN")
+        .or_else(|| env_obj.get("ANTHROPIC_API_KEY"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Claude settings 中缺少 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY；请先在 Claude Code 中完成登录或配置 API Key"
+            )
+        })?;
+
+    let base_url = env_obj
+        .get("ANTHROPIC_BASE_URL")
+        .and_then(|v| v.as_str())
+        .unwrap_or("https://api.anthropic.com/v1")
+        .to_string();
+
+    let mut tags = HashMap::new();
+    tags.insert("source".into(), "claude-settings".into());
+    tags.insert("provider_id".into(), "anthropic".into());
+
+    let upstream = UpstreamConfig {
+        base_url,
+        auth: UpstreamAuth {
+            auth_token: Some(api_key),
+            api_key: None,
+        },
+        tags,
+    };
+
+    let service = ServiceConfig {
+        name: "default".to_string(),
+        alias: Some("Claude default".to_string()),
+        upstreams: vec![upstream],
+    };
+
+    cfg.claude.configs.insert("default".to_string(), service);
+    cfg.claude.active = Some("default".to_string());
 
     Ok(())
 }
@@ -293,6 +384,30 @@ pub async fn load_or_bootstrap_from_codex() -> Result<ProxyConfig> {
                 "检测到 Codex 配置但没有激活项，将使用任意一条配置作为默认；如需指定，请使用 `codex-proxy config set-active <name>`"
             );
         }
+    }
+    Ok(cfg)
+}
+
+/// 加载代理配置，如有必要从 ~/.claude 初始化 Claude 配置。
+pub async fn load_or_bootstrap_from_claude() -> Result<ProxyConfig> {
+    let mut cfg = load_config().await?;
+    if cfg.claude.configs.is_empty() {
+        match bootstrap_from_claude(&mut cfg) {
+            Ok(()) => {
+                let _ = save_config(&cfg).await;
+                info!("已根据 ~/.claude/settings.json 自动创建默认 Claude 上游配置");
+            }
+            Err(err) => {
+                warn!(
+                    "无法从 ~/.claude 引导 Claude 配置: {err}; \
+                     如果尚未安装或配置 Claude Code 可以忽略，否则请检查 ~/.claude/settings.json，或在 ~/.codex-proxy/config.json 中手动添加 claude 配置"
+                );
+            }
+        }
+    } else if cfg.claude.active.is_none() && !cfg.claude.configs.is_empty() {
+        warn!(
+            "检测到 Claude 配置但没有激活项，将使用任意一条配置作为默认；如需指定，请使用 `codex-helper config set-active <name>`（后续将扩展对 Claude 的专用子命令）"
+        );
     }
     Ok(cfg)
 }

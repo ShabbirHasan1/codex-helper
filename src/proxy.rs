@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use anyhow::{anyhow, Result};
-use axum::body::{to_bytes, Body};
+use anyhow::{Result, anyhow};
+use axum::Router;
+use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use axum::routing::any;
-use axum::Router;
 use futures_util::TryStreamExt;
 use reqwest::Client;
 use tracing::{info, instrument, warn};
@@ -66,19 +66,15 @@ impl ProxyService {
         upstream: &SelectedUpstream,
         uri: &Uri,
     ) -> Result<(reqwest::Url, HeaderMap)> {
-        let base = upstream
-            .upstream
-            .base_url
-            .trim_end_matches('/')
-            .to_string();
+        let base = upstream.upstream.base_url.trim_end_matches('/').to_string();
         let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
         let full = format!("{base}{path_and_query}");
-        let mut url = reqwest::Url::parse(&full)
-            .map_err(|e| anyhow!("invalid upstream url {full}: {e}"))?;
+        let url =
+            reqwest::Url::parse(&full).map_err(|e| anyhow!("invalid upstream url {full}: {e}"))?;
 
         // ensure query preserved (Url::parse already includes it)
-        let mut headers = HeaderMap::new();
-        Ok((url.to_owned(), headers))
+        let headers = HeaderMap::new();
+        Ok((url, headers))
     }
 }
 
@@ -130,10 +126,7 @@ pub async fn handle_proxy(
     }
 
     if let Some(v) = auth_header {
-        headers.insert(
-            HeaderName::from_static("authorization"),
-            v,
-        );
+        headers.insert(HeaderName::from_static("authorization"), v);
     }
     if let Some(v) = api_key_header {
         headers.insert(HeaderName::from_static("x-api-key"), v);
@@ -154,7 +147,8 @@ pub async fn handle_proxy(
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let filtered_body = proxy.filter.apply(&raw_body);
 
-    info!(
+    // 详细转发日志仅在 debug 级别输出，避免刷屏。
+    tracing::debug!(
         "forwarding {} {} to {} ({})",
         method,
         uri.path(),
@@ -192,6 +186,23 @@ pub async fn handle_proxy(
     lb.record_result(selected.index, success);
 
     let is_user_turn = method == Method::POST && uri.path().starts_with("/v1/responses");
+    let is_codex_service = proxy.service_name == "codex";
+
+    // 对用户对话轮次输出更有信息量的 info 日志。
+    if is_user_turn {
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        // 当前实现中，SelectedUpstream 只携带 config_name，别名可以在后续重构中通过扩展结构体补充。
+        info!(
+            "user turn {} {} using config '{}' (cwd: {})",
+            method,
+            uri.path(),
+            selected.config_name,
+            cwd
+        );
+    }
 
     if is_stream {
         #[derive(Default)]
@@ -209,6 +220,25 @@ pub async fn handle_proxy(
         let base_url = selected.upstream.base_url.clone();
         let service_name = proxy.service_name.to_string();
         let start_time = start;
+
+        // 对于流式用户请求，也触发一次用量查询（如 packycode），用于驱动“用完自动切换”。
+        if is_user_turn && is_codex_service {
+            tokio::spawn({
+                let cfg = proxy.config.clone();
+                let lb_states = proxy.lb_states.clone();
+                let config_name = selected.config_name.clone();
+                let upstream_index = selected.index;
+                async move {
+                    usage_providers::poll_for_codex_upstream(
+                        cfg,
+                        lb_states,
+                        &config_name,
+                        upstream_index,
+                    )
+                    .await;
+                }
+            });
+        }
 
         let stream = resp
             .bytes_stream()
@@ -281,7 +311,7 @@ pub async fn handle_proxy(
         );
 
         // 在用户请求完成后触发一次用量查询（如 packycode），用于驱动“用完自动切换”
-        if is_user_turn {
+        if is_user_turn && is_codex_service {
             usage_providers::poll_for_codex_upstream(
                 proxy.config.clone(),
                 proxy.lb_states.clone(),
@@ -299,8 +329,5 @@ pub async fn handle_proxy(
 }
 
 pub fn router(proxy: ProxyService) -> Router {
-    Router::new().route(
-        "/*path",
-        any(move |req| handle_proxy(proxy.clone(), req)),
-    )
+    Router::new().route("/*path", any(move |req| handle_proxy(proxy.clone(), req)))
 }

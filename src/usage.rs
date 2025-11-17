@@ -47,7 +47,10 @@ fn usage_from_value(usage_obj: &Value) -> UsageMetrics {
     } else {
         m.total_tokens = m.input_tokens + m.output_tokens;
     }
-    if let Some(details) = usage_obj.get("output_tokens_details").and_then(|v| v.as_object()) {
+    if let Some(details) = usage_obj
+        .get("output_tokens_details")
+        .and_then(|v| v.as_object())
+    {
         if let Some(v) = details.get("reasoning_tokens") {
             m.reasoning_tokens = to_i64(v);
         }
