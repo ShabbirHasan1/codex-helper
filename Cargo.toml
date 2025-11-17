@@ -30,6 +30,7 @@ futures-util = "0.3.31"
 clap = { version = "4.5.20", features = ["derive"] }
 regex = "1.11.1"
 atty = "0.2.14"
+owo-colors = "4.0.0"
 
 [package.metadata.binstall]
 pkg-url = "{ host }/{ owner }/{ repo }/releases/download/{ version }/{ name }-{ version }-{ target }.{ archive-format }"

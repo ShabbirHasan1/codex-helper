@@ -57,11 +57,10 @@ impl RequestFilter {
 
     fn reload_if_needed(&self, inner: &mut Inner) {
         let now = SystemTime::now();
-        if let Some(last) = inner.last_check {
-            if now.duration_since(last).unwrap_or_default() < self.check_interval {
+        if let Some(last) = inner.last_check
+            && now.duration_since(last).unwrap_or_default() < self.check_interval {
                 return;
             }
-        }
         inner.last_check = Some(now);
 
         let meta = match std::fs::metadata(&self.path) {

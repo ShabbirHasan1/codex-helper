@@ -95,7 +95,8 @@ codex-helper serve --port 3211
 - 监听 `127.0.0.1:<port>`；
 - Codex 模式下，首次运行会尝试从 `~/.codex/config.toml` 与 `~/.codex/auth.json` 推导默认上游：
   - 使用当前 `model_provider`；
-  - 使用其 `env_key` / `auth.json` 中的 token 作为上游 `auth_token`；
+  - 优先使用 provider 的 `env_key` 对应的环境变量 / `auth.json` 字段；
+  - 如未声明 `env_key`，且 `auth.json` 中存在唯一的 `*_API_KEY` 字段（例如 `OPENAI_API_KEY`），则自动推断并复用该字段作为上游 token；
 - 如无法解析到有效 token，会直接报错退出（fail-fast），避免“默默每次 401/403”的情况。
 
 ### 4. 智能 session 辅助（Codex）
@@ -203,10 +204,21 @@ codex-helper session last --path ~/code/my-app
 ### 配置文件位置
 
 - 主配置：`~/.codex-proxy/config.json`
-  - `codex`：Codex 上游配置。
+  - `codex`：Codex 上游配置（来源可以是手动添加，也可以通过 Codex CLI 配置自动导入）。
 - 请求过滤：`~/.codex-proxy/filter.json`
 - 用量提供商：`~/.codex-proxy/usage_providers.json`
 - 请求日志：`~/.codex-proxy/logs/requests.jsonl`
+
+Codex 官方配置文件：
+
+- 认证信息：`~/.codex/auth.json`
+  - 由 `codex login` 等命令维护；
+  - codex-helper 只会读取该文件，不会自动写入或修改；
+  - 在未显式配置 `env_key` 时，如检测到唯一的 `*_API_KEY` 字段（例如 `OPENAI_API_KEY`），会自动将其视为当前上游的 token。
+- 行为配置：`~/.codex/config.toml`
+  - 由 Codex CLI 维护；
+  - `codex-helper switch-on` 会在备份原始文件后，将 `model_provider` 指向本地代理 `codex_proxy`；
+  - 你可以通过 `codex-helper config import-from-codex` 显式从该文件（加上 `auth.json`）导入默认上游配置到 `~/.codex-proxy/config.json`。
 
 ### `config.json` 示例
 
@@ -338,7 +350,39 @@ codex-helper config set-active openai-main
 }
 ```
 
-你可以用 `jq` 等工具按配置名 / 上游 / 时间窗口做用量分析或问题排查。
+这些字段是 **稳定契约**，后续版本只会在此基础上追加字段，不会删除或改名，方便脚本和其他工具长期依赖。
+
+你可以用 `jq` 等工具按配置名 / 上游 / 时间窗口做用量分析或问题排查。例如：
+
+```bash
+# 按配置名聚合 total_tokens
+codex-helper usage tail --limit 100 --raw \
+  | jq -s 'group_by(.config_name) | map({config: .[0].config_name, total: (map(.usage.total_tokens // 0) | add)})'
+```
+
+也可以使用内置的汇总命令：
+
+```bash
+codex-helper usage summary
+```
+
+或查看原始 JSON 行：
+
+```bash
+codex-helper usage tail --limit 20 --raw
+```
+
+对于整体状态和环境诊断，你还可以使用：
+
+```bash
+# 人类可读的状态与诊断
+codex-helper status
+codex-helper doctor
+
+# 机器可读 JSON 输出，方便脚本 / UI 集成
+codex-helper status --json | jq .
+codex-helper doctor --json | jq '.checks[] | select(.status != "ok")'
+```
 
 ## 与 cli_proxy / cc-switch 的关系
 

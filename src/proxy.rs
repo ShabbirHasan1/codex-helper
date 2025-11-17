@@ -185,7 +185,12 @@ pub async fn handle_proxy(
     let success = status.is_success();
     lb.record_result(selected.index, success);
 
-    let is_user_turn = method == Method::POST && uri.path().starts_with("/v1/responses");
+    // Codex Responses API 在本地代理层的路径通常为 `/responses`，
+    // 实际上游 base_url 可能已包含 `/v1` 前缀（例如 https://api.openai.com/v1），
+    // 因此这里仅根据是否以 `/responses` 结尾来识别“用户轮次”请求。
+    let path = uri.path();
+    let is_responses_path = path.ends_with("/responses");
+    let is_user_turn = method == Method::POST && is_responses_path;
     let is_codex_service = proxy.service_name == "codex";
 
     // 对用户对话轮次输出更有信息量的 info 日志。

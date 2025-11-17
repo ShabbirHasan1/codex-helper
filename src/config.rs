@@ -64,6 +64,9 @@ impl ServiceConfigManager {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProxyConfig {
+    /// Optional config schema version for future migrations
+    #[serde(default)]
+    pub version: Option<u32>,
     /// Codex 服务配置
     #[serde(default)]
     pub codex: ServiceConfigManager,
@@ -80,22 +83,50 @@ fn config_path() -> PathBuf {
     config_dir().join("config.json")
 }
 
+fn config_backup_path() -> PathBuf {
+    config_dir().join("config.json.bak")
+}
+
+const CONFIG_VERSION: u32 = 1;
+
+fn ensure_config_version(cfg: &mut ProxyConfig) {
+    if cfg.version.is_none() {
+        cfg.version = Some(CONFIG_VERSION);
+    }
+}
+
 pub async fn load_config() -> Result<ProxyConfig> {
     let path = config_path();
     if !path.exists() {
-        return Ok(ProxyConfig::default());
+        let mut cfg = ProxyConfig::default();
+        ensure_config_version(&mut cfg);
+        return Ok(cfg);
     }
     let bytes = fs::read(path).await?;
-    let cfg = serde_json::from_slice::<ProxyConfig>(&bytes)?;
+    let mut cfg = serde_json::from_slice::<ProxyConfig>(&bytes)?;
+    ensure_config_version(&mut cfg);
     Ok(cfg)
 }
 
 pub async fn save_config(cfg: &ProxyConfig) -> Result<()> {
+    let mut cfg = cfg.clone();
+    ensure_config_version(&mut cfg);
+
     let dir = config_dir();
     fs::create_dir_all(&dir).await?;
     let path = config_path();
-    let data = serde_json::to_vec_pretty(cfg)?;
-    fs::write(path, data).await?;
+    let backup_path = config_backup_path();
+    let data = serde_json::to_vec_pretty(&cfg)?;
+
+    // 先备份旧文件（若存在），再采用临时文件 + rename 方式原子写入，尽量避免配置损坏。
+    if path.exists()
+        && let Err(err) = fs::copy(&path, &backup_path).await {
+            warn!("failed to backup {:?} to {:?}: {}", path, backup_path, err);
+        }
+
+    let tmp_path = dir.join("config.json.tmp");
+    fs::write(&tmp_path, &data).await?;
+    fs::rename(&tmp_path, &path).await?;
     Ok(())
 }
 
@@ -128,15 +159,15 @@ fn codex_home() -> PathBuf {
         .join(".codex")
 }
 
-fn codex_config_path() -> PathBuf {
+pub fn codex_config_path() -> PathBuf {
     codex_home().join("config.toml")
 }
 
-fn codex_backup_config_path() -> PathBuf {
+pub fn codex_backup_config_path() -> PathBuf {
     codex_home().join("config.toml.codex-proxy-backup")
 }
 
-fn codex_auth_path() -> PathBuf {
+pub fn codex_auth_path() -> PathBuf {
     codex_home().join("auth.json")
 }
 
@@ -177,6 +208,13 @@ pub fn codex_sessions_dir() -> PathBuf {
     codex_home().join("sessions")
 }
 
+/// 支持的上游服务类型：Codex / Claude。
+#[derive(Debug, Clone, Copy)]
+pub enum ServiceKind {
+    Codex,
+    Claude,
+}
+
 fn read_file_if_exists(path: &Path) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
@@ -186,20 +224,16 @@ fn read_file_if_exists(path: &Path) -> Result<Option<String>> {
 }
 
 fn resolve_auth_token(env_key: &str, auth_json: &Option<JsonValue>) -> Option<String> {
-    if let Ok(val) = env::var(env_key) {
-        if !val.trim().is_empty() {
+    if let Ok(val) = env::var(env_key)
+        && !val.trim().is_empty() {
             return Some(val);
         }
-    }
-    if let Some(json) = auth_json {
-        if let Some(obj) = json.as_object() {
-            if let Some(v) = obj.get(env_key).and_then(|v| v.as_str()) {
-                if !v.trim().is_empty() {
+    if let Some(json) = auth_json
+        && let Some(obj) = json.as_object()
+            && let Some(v) = obj.get(env_key).and_then(|v| v.as_str())
+                && !v.trim().is_empty() {
                     return Some(v.to_string());
                 }
-            }
-        }
-    }
     None
 }
 
@@ -316,8 +350,8 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
         .as_deref()
         .and_then(|key| resolve_auth_token(key, &auth_json));
 
-    if auth_token.is_none() && effective_env_key.is_none() {
-        if let Some((inferred_key, inferred_token)) = infer_env_key_from_auth_json(&auth_json) {
+    if auth_token.is_none() && effective_env_key.is_none()
+        && let Some((inferred_key, inferred_token)) = infer_env_key_from_auth_json(&auth_json) {
             info!(
                 "当前 model_provider 未声明 env_key，已从 ~/.codex/auth.json 自动推断为 `{}`",
                 inferred_key
@@ -325,7 +359,6 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
             effective_env_key = Some(inferred_key);
             auth_token = Some(inferred_token);
         }
-    }
 
     if auth_token.is_none() {
         if let Some(key) = effective_env_key.as_deref() {
@@ -420,9 +453,7 @@ fn bootstrap_from_claude(cfg: &mut ProxyConfig) -> Result<()> {
 
     // 如当前 base_url 看起来是本地地址且没有备份，则无法安全推导真实上游，
     // 直接报错，避免将 Claude 代理指向自身。
-    if !backup_path.exists()
-        && (base_url.contains("127.0.0.1") || base_url.contains("localhost"))
-    {
+    if !backup_path.exists() && (base_url.contains("127.0.0.1") || base_url.contains("localhost")) {
         anyhow::bail!(
             "检测到 Claude settings {:?} 的 ANTHROPIC_BASE_URL 指向本地地址 ({base_url})，且未找到备份配置；\
 无法自动推导原始 Claude 上游。请先恢复 Claude 配置后重试，或在 ~/.codex-proxy/config.json 中手动添加 claude 上游配置。",
@@ -484,6 +515,27 @@ pub async fn load_or_bootstrap_from_codex() -> Result<ProxyConfig> {
     Ok(cfg)
 }
 
+/// 显式从 Codex CLI 的配置文件（~/.codex/config.toml + auth.json）导入/刷新 codex 段配置。
+/// - 当 force = false 且当前已存在 codex 配置时，将返回错误，避免意外覆盖；
+/// - 当 force = true 时，将清空现有 codex 段后重新基于 Codex 配置推导。
+pub async fn import_codex_config_from_codex_cli(force: bool) -> Result<ProxyConfig> {
+    let mut cfg = load_config().await?;
+    if !cfg.codex.configs.is_empty() && !force {
+        anyhow::bail!(
+            "检测到 ~/.codex-proxy/config.json 中已存在 Codex 配置；如需根据 ~/.codex/config.toml 重新导入，请使用 --force 覆盖"
+        );
+    }
+
+    cfg.codex = ServiceConfigManager::default();
+    bootstrap_from_codex(&mut cfg)?;
+    save_config(&cfg).await?;
+    info!(
+        "已根据 ~/.codex/config.toml 与 ~/.codex/auth.json 重新导入 Codex 上游配置（force = {}）",
+        force
+    );
+    Ok(cfg)
+}
+
 /// 加载代理配置，如有必要从 ~/.claude 初始化 Claude 配置。
 pub async fn load_or_bootstrap_from_claude() -> Result<ProxyConfig> {
     let mut cfg = load_config().await?;
@@ -506,4 +558,258 @@ pub async fn load_or_bootstrap_from_claude() -> Result<ProxyConfig> {
         );
     }
     Ok(cfg)
+}
+
+/// Unified entry to load proxy config and, if necessary, bootstrap upstreams
+/// from the official Codex / Claude configuration files.
+pub async fn load_or_bootstrap_for_service(kind: ServiceKind) -> Result<ProxyConfig> {
+    match kind {
+        ServiceKind::Codex => load_or_bootstrap_from_codex().await,
+        ServiceKind::Claude => load_or_bootstrap_from_claude().await,
+    }
+}
+
+/// Probe whether we can successfully bootstrap Codex upstreams from
+/// ~/.codex/config.toml and ~/.codex/auth.json without mutating any
+/// codex-helper configs. Intended for diagnostics (`codex-helper doctor`).
+pub async fn probe_codex_bootstrap_from_cli() -> Result<()> {
+    let mut cfg = ProxyConfig::default();
+    bootstrap_from_codex(&mut cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infer_env_key_from_auth_json_single_key() {
+        let json = serde_json::json!({
+            "OPENAI_API_KEY": "sk-test-123",
+            "tokens": null
+        });
+        let auth = Some(json);
+        let inferred = infer_env_key_from_auth_json(&auth);
+        assert!(inferred.is_some());
+        let (key, value) = inferred.unwrap();
+        assert_eq!(key, "OPENAI_API_KEY");
+        assert_eq!(value, "sk-test-123");
+    }
+
+    #[test]
+    fn infer_env_key_from_auth_json_multiple_keys() {
+        let json = serde_json::json!({
+            "OPENAI_API_KEY": "sk-test-1",
+            "MISTRAL_API_KEY": "sk-test-2"
+        });
+        let auth = Some(json);
+        let inferred = infer_env_key_from_auth_json(&auth);
+        assert!(inferred.is_none());
+    }
+
+    #[test]
+    fn infer_env_key_from_auth_json_none() {
+        let json = serde_json::json!({
+            "tokens": {
+                "id_token": "xxx"
+            }
+        });
+        let auth = Some(json);
+        let inferred = infer_env_key_from_auth_json(&auth);
+        assert!(inferred.is_none());
+    }
+
+    fn setup_temp_codex_home() -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        let suffix = format!("codex-helper-test-{}", uuid::Uuid::new_v4().to_string());
+        dir.push(suffix);
+        std::fs::create_dir_all(&dir).expect("create temp codex home");
+        std::env::set_var("CODEX_HOME", &dir);
+        // 将 HOME 也指向该目录，确保 proxy_home_dir()/config.json 也被隔离在测试目录中。
+        std::env::set_var("HOME", &dir);
+        dir
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dirs");
+        }
+        std::fs::write(path, content).expect("write test file");
+    }
+
+    #[test]
+    fn bootstrap_from_codex_with_env_key_and_auth_json() {
+        let home = setup_temp_codex_home();
+        // Write config.toml with explicit env_key
+        let cfg_path = home.join("config.toml");
+        let config_text = r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "OpenAI"
+base_url = "https://api.openai.com/v1"
+env_key = "OPENAI_API_KEY"
+"#;
+        write_file(&cfg_path, config_text);
+
+        // Write auth.json with matching OPENAI_API_KEY
+        let auth_path = home.join("auth.json");
+        let auth_text = r#"{ "OPENAI_API_KEY": "sk-test-123" }"#;
+        write_file(&auth_path, auth_text);
+
+        let mut cfg = ProxyConfig::default();
+        bootstrap_from_codex(&mut cfg).expect("bootstrap_from_codex should succeed");
+
+        assert!(!cfg.codex.configs.is_empty());
+        let svc = cfg.codex.active_config().expect("active codex config");
+        assert_eq!(svc.name, "openai");
+        assert_eq!(svc.upstreams.len(), 1);
+        let up = &svc.upstreams[0];
+        assert_eq!(up.base_url, "https://api.openai.com/v1");
+        assert_eq!(
+            up.auth.auth_token.as_deref(),
+            Some("sk-test-123"),
+            "auth_token should come from OPENAI_API_KEY"
+        );
+    }
+
+    #[test]
+    fn bootstrap_from_codex_infers_env_key_from_auth_json_when_missing() {
+        let home = setup_temp_codex_home();
+        // config.toml without env_key
+        let cfg_path = home.join("config.toml");
+        let config_text = r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "OpenAI"
+base_url = "https://api.openai.com/v1"
+"#;
+        write_file(&cfg_path, config_text);
+
+        // auth.json with a single *_API_KEY field
+        let auth_path = home.join("auth.json");
+        let auth_text = r#"{ "OPENAI_API_KEY": "sk-test-456" }"#;
+        write_file(&auth_path, auth_text);
+
+        let mut cfg = ProxyConfig::default();
+        bootstrap_from_codex(&mut cfg).expect("bootstrap_from_codex should infer env_key");
+
+        let svc = cfg.codex.active_config().expect("active codex config");
+        assert_eq!(svc.name, "openai");
+        let up = &svc.upstreams[0];
+        assert_eq!(
+            up.auth.auth_token.as_deref(),
+            Some("sk-test-456"),
+            "auth_token should be inferred from unique *_API_KEY"
+        );
+    }
+
+    #[test]
+    fn bootstrap_from_codex_fails_when_multiple_api_keys_without_env_key() {
+        let home = setup_temp_codex_home();
+        // config.toml still without env_key
+        let cfg_path = home.join("config.toml");
+        let config_text = r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "OpenAI"
+base_url = "https://api.openai.com/v1"
+"#;
+        write_file(&cfg_path, config_text);
+
+        // auth.json with multiple *_API_KEY fields
+        let auth_path = home.join("auth.json");
+        let auth_text = r#"
+{
+  "OPENAI_API_KEY": "sk-test-1",
+  "MISTRAL_API_KEY": "sk-test-2"
+}
+"#;
+        write_file(&auth_path, auth_text);
+
+        let mut cfg = ProxyConfig::default();
+        let err = bootstrap_from_codex(&mut cfg).expect_err("should fail to infer unique token");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("无法从 ~/.codex/auth.json 推断唯一的 token"),
+            "unexpected error message: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn load_or_bootstrap_for_service_writes_proxy_config() {
+        let home = setup_temp_codex_home();
+        // Prepare Codex CLI config and auth under CODEX_HOME/HOME
+        let cfg_path = home.join("config.toml");
+        let config_text = r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "OpenAI"
+base_url = "https://api.openai.com/v1"
+env_key = "OPENAI_API_KEY"
+"#;
+        write_file(&cfg_path, config_text);
+
+        let auth_path = home.join("auth.json");
+        let auth_text = r#"{ "OPENAI_API_KEY": "sk-test-789" }"#;
+        write_file(&auth_path, auth_text);
+
+        // 确保 proxy 配置文件起始不存在
+        let proxy_cfg_path = super::proxy_home_dir().join("config.json");
+        let _ = std::fs::remove_file(&proxy_cfg_path);
+
+        let cfg = super::load_or_bootstrap_for_service(ServiceKind::Codex)
+            .await
+            .expect("load_or_bootstrap_for_service should succeed");
+
+        // 内存中的配置应包含 openai upstream 与正确的 token
+        let svc = cfg.codex.active_config().expect("active codex config");
+        assert_eq!(svc.name, "openai");
+        assert_eq!(svc.upstreams.len(), 1);
+        assert_eq!(
+            svc.upstreams[0].auth.auth_token.as_deref(),
+            Some("sk-test-789")
+        );
+
+        // 并且应已将配置写入到 proxy_home_dir()/config.json
+        let text = std::fs::read_to_string(&proxy_cfg_path)
+            .expect("config.json should be written by load_or_bootstrap");
+        let loaded: ProxyConfig =
+            serde_json::from_str(&text).expect("config.json should be valid ProxyConfig");
+        let svc2 = loaded.codex.active_config().expect("active codex config");
+        assert_eq!(svc2.name, "openai");
+        assert_eq!(
+            svc2.upstreams[0].auth.auth_token.as_deref(),
+            Some("sk-test-789")
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_codex_bootstrap_detects_codex_proxy_without_backup() {
+        let home = setup_temp_codex_home();
+        let cfg_path = home.join("config.toml");
+        let config_text = r#"
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "codex-helper"
+base_url = "http://127.0.0.1:3211"
+wire_api = "responses"
+"#;
+        write_file(&cfg_path, config_text);
+
+        // 不写备份文件，模拟“已经被本地代理接管且无原始备份”的场景
+        let err = super::probe_codex_bootstrap_from_cli()
+            .await
+            .expect_err("probe should fail when model_provider is codex_proxy without backup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("当前 model_provider 指向本地代理 codex-helper，且未找到备份配置"),
+            "unexpected error message: {}",
+            msg
+        );
+    }
 }

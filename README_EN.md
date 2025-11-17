@@ -106,7 +106,9 @@ On startup:
 - The proxy listens on `127.0.0.1:<port>`.
 - In Codex mode, on first run it bootstraps a default upstream from `~/.codex`:
   - Uses the current `model_provider`.
-  - Resolves its `env_key` / `auth.json` into an upstream `auth_token`.
+  - Resolves its `env_key` / `auth.json` into an upstream `auth_token`:
+    - Prefer the provider's `env_key` (environment variable and `auth.json` field);
+    - If no `env_key` is declared and `auth.json` contains a single `*_API_KEY` field (for example `OPENAI_API_KEY`), that field is treated as the upstream token.
 - If it cannot resolve a valid token for Codex upstreams, the process fails fast with an error.
 
 ### 4. Session helpers (Codex)
@@ -150,10 +152,21 @@ Resume with:
 ### Files
 
 - Main config: `~/.codex-proxy/config.json`
-  - Contains `codex` configurations.
+  - Contains `codex` configurations (either added manually or imported from Codex CLI config).
 - Filter rules: `~/.codex-proxy/filter.json`
 - Usage providers: `~/.codex-proxy/usage_providers.json`
 - Request logs: `~/.codex-proxy/logs/requests.jsonl`
+
+Codex official config files:
+
+- Auth: `~/.codex/auth.json`
+  - Managed by `codex login` and other Codex commands.
+  - codex-helper only reads this file; it never modifies it automatically.
+  - When no `env_key` is declared for the current provider and there is exactly one `*_API_KEY` field (for example `OPENAI_API_KEY`), that field is treated as the upstream token.
+- Behavior/config: `~/.codex/config.toml`
+  - Managed by Codex CLI.
+  - `codex-helper switch-on` backs it up and then points `model_provider` to the local proxy `codex_proxy`.
+  - You can explicitly import a default upstream derived from this file (plus `auth.json`) into `~/.codex-proxy/config.json` via `codex-helper config import-from-codex`.
 
 ### `config.json` layout (brief)
 
@@ -311,7 +324,34 @@ Each line is a JSON object, e.g.:
 }
 ```
 
-You can use tools like `jq` to aggregate usage by config, upstream, or time window.
+The fields above form a **stable contract** for tooling: future versions will only add fields, not remove or rename the existing ones. This makes it safe to build scripts and dashboards on top of `requests.jsonl`.
+
+You can use tools like `jq` to aggregate usage by config, upstream, or time window. For example:
+
+```bash
+# Aggregate total_tokens by config_name from the last 100 entries
+codex-helper usage tail --limit 100 --raw \
+  | jq -s 'group_by(.config_name) | map({config: .[0].config_name, total: (map(.usage.total_tokens // 0) | add)})'
+```
+
+You can also use the built-in helpers:
+
+```bash
+codex-helper usage summary
+codex-helper usage tail --limit 20 --raw
+```
+
+For high-level status and environment diagnostics:
+
+```bash
+# Human-friendly views
+codex-helper status
+codex-helper doctor
+
+# JSON views for scripts / UI integration
+codex-helper status --json | jq .
+codex-helper doctor --json | jq '.checks[] | select(.status != "ok")'
+```
 
 ## Relationship to cli_proxy and cc-switch
 

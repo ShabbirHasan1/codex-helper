@@ -25,11 +25,10 @@ fn extract_usage_obj(payload: &Value) -> Option<&Value> {
     if let Some(u) = payload.get("usage") {
         return Some(u);
     }
-    if let Some(resp) = payload.get("response") {
-        if let Some(u) = resp.get("usage") {
+    if let Some(resp) = payload.get("response")
+        && let Some(u) = resp.get("usage") {
             return Some(u);
         }
-    }
     None
 }
 
@@ -50,11 +49,9 @@ fn usage_from_value(usage_obj: &Value) -> UsageMetrics {
     if let Some(details) = usage_obj
         .get("output_tokens_details")
         .and_then(|v| v.as_object())
-    {
-        if let Some(v) = details.get("reasoning_tokens") {
+        && let Some(v) = details.get("reasoning_tokens") {
             m.reasoning_tokens = to_i64(v);
         }
-    }
     m
 }
 
@@ -84,11 +81,10 @@ pub fn extract_usage_from_sse_bytes(data: &[u8]) -> Option<UsageMetrics> {
                 if payload_str.is_empty() {
                     continue;
                 }
-                if let Ok(json) = serde_json::from_str::<Value>(payload_str) {
-                    if let Some(usage_obj) = extract_usage_obj(&json) {
+                if let Ok(json) = serde_json::from_str::<Value>(payload_str)
+                    && let Some(usage_obj) = extract_usage_obj(&json) {
                         last = Some(usage_from_value(usage_obj));
                     }
-                }
             }
         }
     }

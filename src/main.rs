@@ -1,4 +1,5 @@
 mod codex_integration;
+mod commands;
 mod config;
 mod filter;
 mod lb;
@@ -8,18 +9,17 @@ mod sessions;
 mod usage;
 mod usage_providers;
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-
-use anyhow::Result;
 use axum::Router;
 use clap::{Parser, Subcommand};
+use owo_colors::OwoColorize;
 use reqwest::Client;
 use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{load_config, load_or_bootstrap_from_claude, load_or_bootstrap_from_codex};
+use crate::config::{ServiceKind, load_or_bootstrap_for_service};
 use crate::proxy::{ProxyService, router as proxy_router};
 
 #[derive(Parser, Debug)]
@@ -28,6 +28,39 @@ use crate::proxy::{ProxyService, router as proxy_router};
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+pub type CliResult<T> = Result<T, CliError>;
+
+#[derive(Debug)]
+pub enum CliError {
+    /// Errors related to codex-helper's own config.json
+    ProxyConfig(String),
+    /// Errors while reading or interpreting Codex CLI config/auth files
+    CodexConfig(String),
+    /// Errors while working with usage logs / usage_providers.json
+    Usage(String),
+    /// Generic fallback for other failures
+    Other(String),
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CliError::ProxyConfig(msg) => write!(f, "Proxy config error: {}", msg),
+            CliError::CodexConfig(msg) => write!(f, "Codex config error: {}", msg),
+            CliError::Usage(msg) => write!(f, "Usage error: {}", msg),
+            CliError::Other(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl std::error::Error for CliError {}
+
+impl From<anyhow::Error> for CliError {
+    fn from(e: anyhow::Error) -> Self {
+        CliError::Other(e.to_string())
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -74,6 +107,23 @@ enum Command {
         #[command(subcommand)]
         cmd: SessionCommand,
     },
+    /// Run environment diagnostics for Codex CLI and codex-helper
+    Doctor {
+        /// Output diagnostics as JSON (machine-readable), without ANSI colors
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a brief status summary of codex-helper and upstream configs
+    Status {
+        /// Output status as JSON (machine-readable), without ANSI colors
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect usage logs written by codex-helper
+    Usage {
+        #[command(subcommand)]
+        cmd: UsageCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -114,6 +164,12 @@ enum ConfigCommand {
         #[arg(long)]
         claude: bool,
     },
+    /// Import Codex upstream config from ~/.codex/config.toml + auth.json into ~/.codex-proxy/config.json
+    ImportFromCodex {
+        /// Overwrite existing Codex configs in ~/.codex-proxy/config.json
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -135,8 +191,34 @@ enum SessionCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum UsageCommand {
+    /// Show recent requests with basic usage info from ~/.codex-proxy/logs/requests.jsonl
+    Tail {
+        /// Maximum number of recent entries to print
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Print raw JSON lines instead of human-friendly format
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Summarize total token usage per config from ~/.codex-proxy/logs/requests.jsonl
+    Summary {
+        /// Maximum number of configs to show (sorted by total_tokens desc)
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(err) = real_main().await {
+        eprintln!("{}", err.to_string().red());
+        std::process::exit(1);
+    }
+}
+
+async fn real_main() -> CliResult<()> {
     // 默认启用 info 级别日志，若用户设置了 RUST_LOG 则按其配置。
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
@@ -154,7 +236,9 @@ async fn main() -> Result<()> {
             claude,
         } => {
             if codex && claude {
-                anyhow::bail!("Please specify at most one of --codex / --claude");
+                return Err(CliError::Other(
+                    "Please specify at most one of --codex / --claude".to_string(),
+                ));
             }
             if claude {
                 if let Err(err) =
@@ -165,27 +249,44 @@ async fn main() -> Result<()> {
                 codex_integration::claude_switch_on(port)?;
             } else {
                 codex_integration::guard_codex_config_before_switch_on_interactive()?;
-                codex_integration::switch_on(port)?;
+                codex_integration::switch_on(port)
+                    .map_err(|e| CliError::CodexConfig(e.to_string()))?;
             }
             return Ok(());
         }
         Command::SwitchOff { codex, claude } => {
             if codex && claude {
-                anyhow::bail!("Please specify at most one of --codex / --claude");
+                return Err(CliError::Other(
+                    "Please specify at most one of --codex / --claude".to_string(),
+                ));
             }
             if claude {
-                codex_integration::claude_switch_off()?;
+                codex_integration::claude_switch_off()
+                    .map_err(|e| CliError::CodexConfig(e.to_string()))?;
             } else {
-                codex_integration::switch_off()?;
+                codex_integration::switch_off()
+                    .map_err(|e| CliError::CodexConfig(e.to_string()))?;
             }
             return Ok(());
         }
         Command::Config { cmd } => {
-            handle_config_cmd(cmd).await?;
+            commands::config::handle_config_cmd(cmd).await?;
             return Ok(());
         }
         Command::Session { cmd } => {
-            handle_session_cmd(cmd).await?;
+            commands::session::handle_session_cmd(cmd).await?;
+            return Ok(());
+        }
+        Command::Doctor { json } => {
+            commands::doctor::handle_doctor_cmd(json).await?;
+            return Ok(());
+        }
+        Command::Status { json } => {
+            commands::doctor::handle_status_cmd(json).await?;
+            return Ok(());
+        }
+        Command::Usage { cmd } => {
+            commands::usage::handle_usage_cmd(cmd).await?;
             return Ok(());
         }
         Command::Serve {
@@ -196,14 +297,16 @@ async fn main() -> Result<()> {
             // 默认使用 Codex；如显式指定 --claude 则切换到 Claude。
             let service_name = if claude { "claude" } else { "codex" };
             let port = port.unwrap_or_else(|| if service_name == "codex" { 3211 } else { 3210 });
-            run_server(service_name, port).await?;
+            run_server(service_name, port)
+                .await
+                .map_err(|e| CliError::Other(e.to_string()))?;
         }
     }
 
     Ok(())
 }
 
-async fn run_server(service_name: &'static str, port: u16) -> Result<()> {
+async fn run_server(service_name: &'static str, port: u16) -> anyhow::Result<()> {
     // Codex 模式下，自动将 Codex 切换到本地代理；Claude 模式也会尝试修改 settings.json（实验性）。
     if service_name == "codex" {
         // 在切换前做一次守护性检查：如发现 Codex 已指向本地代理且存在备份，则在交互模式下询问是否先恢复。
@@ -235,12 +338,10 @@ async fn run_server(service_name: &'static str, port: u16) -> Result<()> {
         }
     }
 
-    let cfg = if service_name == "codex" {
-        // Codex：如有必要从 ~/.codex 进行自动引导。
-        Arc::new(load_or_bootstrap_from_codex().await?)
-    } else {
-        // Claude：如有必要从 ~/.claude 进行自动引导。
-        Arc::new(load_or_bootstrap_from_claude().await?)
+    let cfg = match service_name {
+        "codex" => Arc::new(load_or_bootstrap_for_service(ServiceKind::Codex).await?),
+        "claude" => Arc::new(load_or_bootstrap_for_service(ServiceKind::Claude).await?),
+        _ => Arc::new(load_or_bootstrap_for_service(ServiceKind::Codex).await?),
     };
 
     // 严格要求存在至少一个有效的上游配置，否则直接报错退出，
@@ -251,14 +352,13 @@ async fn run_server(service_name: &'static str, port: u16) -> Result<()> {
                 "未找到任何可用的 Codex 上游配置，请先确保 ~/.codex/config.toml 与 ~/.codex/auth.json 配置完整，或手动编辑 ~/.codex-proxy/config.json 添加配置"
             );
         }
-    } else if service_name == "claude" {
-        if cfg.claude.configs.is_empty() || cfg.claude.active_config().is_none() {
+    } else if service_name == "claude"
+        && (cfg.claude.configs.is_empty() || cfg.claude.active_config().is_none()) {
             anyhow::bail!(
                 "未找到任何可用的 Claude 上游配置，请先确保 ~/.claude/settings.json 配置完整，\
 或在 ~/.codex-proxy/config.json 的 `claude` 段下手动添加上游配置"
             );
         }
-    }
     let client = Client::builder().build()?;
 
     // 统一的 LB 状态（失败计数、冷却、用量状态）
@@ -285,210 +385,16 @@ async fn run_server(service_name: &'static str, port: u16) -> Result<()> {
     Ok(())
 }
 
-async fn handle_config_cmd(cmd: ConfigCommand) -> Result<()> {
-    use crate::config::{ServiceConfig, UpstreamAuth, UpstreamConfig, save_config};
-
-    fn resolve_service(codex: bool, claude: bool) -> Result<&'static str> {
-        if codex && claude {
-            anyhow::bail!("Please specify at most one of --codex / --claude");
-        }
-        if claude { Ok("claude") } else { Ok("codex") }
-    }
-
-    match cmd {
-        ConfigCommand::List { codex, claude } => {
-            let service = resolve_service(codex, claude)?;
-            let cfg = load_config().await?;
-            let (mgr, label) = if service == "claude" {
-                (&cfg.claude, "Claude")
-            } else {
-                (&cfg.codex, "Codex")
-            };
-
-            if mgr.configs.is_empty() {
-                println!("No {} configs in ~/.codex-proxy/config.json", label);
-            } else {
-                let active = mgr.active.clone();
-                println!("{} configs:", label);
-                for (name, service_cfg) in &mgr.configs {
-                    let marker = if Some(name) == active.as_ref() {
-                        "*"
-                    } else {
-                        " "
-                    };
-                    if let Some(alias) = &service_cfg.alias {
-                        println!(
-                            "  {} {} [{}] ({} upstreams)",
-                            marker,
-                            name,
-                            alias,
-                            service_cfg.upstreams.len()
-                        );
-                    } else {
-                        println!(
-                            "  {} {} ({} upstreams)",
-                            marker,
-                            name,
-                            service_cfg.upstreams.len()
-                        );
-                    }
-                }
-            }
-        }
-        ConfigCommand::Add {
-            name,
-            base_url,
-            auth_token,
-            alias,
-            codex,
-            claude,
-        } => {
-            let service = resolve_service(codex, claude)?;
-            let mut cfg = load_config().await?;
-
-            let upstream = UpstreamConfig {
-                base_url,
-                auth: UpstreamAuth {
-                    auth_token,
-                    api_key: None,
-                },
-                tags: Default::default(),
-            };
-            let service_cfg = ServiceConfig {
-                name: name.clone(),
-                alias,
-                upstreams: vec![upstream],
-            };
-
-            if service == "claude" {
-                cfg.claude.configs.insert(name.clone(), service_cfg);
-                if cfg.claude.active.is_none() {
-                    cfg.claude.active = Some(name.clone());
-                }
-                save_config(&cfg).await?;
-                println!("Added Claude config '{}'", name);
-            } else {
-                cfg.codex.configs.insert(name.clone(), service_cfg);
-                if cfg.codex.active.is_none() {
-                    cfg.codex.active = Some(name.clone());
-                }
-                save_config(&cfg).await?;
-                println!("Added Codex config '{}'", name);
-            }
-        }
-        ConfigCommand::SetActive {
-            name,
-            codex,
-            claude,
-        } => {
-            let service = resolve_service(codex, claude)?;
-            let mut cfg = load_config().await?;
-
-            if service == "claude" {
-                if !cfg.claude.configs.contains_key(&name) {
-                    println!("Claude config '{}' not found", name);
-                } else {
-                    cfg.claude.active = Some(name.clone());
-                    save_config(&cfg).await?;
-                    println!("Active Claude config set to '{}'", name);
-                }
-            } else {
-                if !cfg.codex.configs.contains_key(&name) {
-                    println!("Codex config '{}' not found", name);
-                } else {
-                    cfg.codex.active = Some(name.clone());
-                    save_config(&cfg).await?;
-                    println!("Active Codex config set to '{}'", name);
-                }
-            }
-        }
-    }
-
+async fn handle_session_cmd(_cmd: SessionCommand) -> CliResult<()> {
     Ok(())
 }
 
-async fn handle_session_cmd(cmd: SessionCommand) -> Result<()> {
-    use crate::sessions::{
-        SessionSummary, find_codex_sessions_for_current_dir, find_codex_sessions_for_dir,
-    };
-
-    match cmd {
-        SessionCommand::List { limit, path } => {
-            let sessions: Vec<SessionSummary> = if let Some(p) = path {
-                let root = std::path::PathBuf::from(p);
-                find_codex_sessions_for_dir(&root, limit).await?
-            } else {
-                find_codex_sessions_for_current_dir(limit).await?
-            };
-            if sessions.is_empty() {
-                println!("No Codex sessions found under ~/.codex/sessions");
-            } else {
-                println!("Recent Codex sessions (newest first):");
-                for s in sessions {
-                    let updated = s.updated_at.as_deref().unwrap_or("-");
-                    let cwd = s.cwd.as_deref().unwrap_or("-");
-                    let preview_raw = s
-                        .first_user_message
-                        .as_deref()
-                        .unwrap_or("")
-                        .replace('\n', " ");
-                    let preview = truncate_for_display(&preview_raw, 80);
-
-                    // 第一行仅显示 id，方便复制
-                    println!("- id: {}", s.id);
-                    // 第二行展示更新时间和 cwd
-                    println!("  updated: {} | cwd: {}", updated, cwd);
-                    // 如有首条用户消息，第三行展示简短预览
-                    if !preview.is_empty() {
-                        println!("  prompt: {}", preview);
-                    }
-                    println!();
-                }
-            }
-        }
-        SessionCommand::Last { path } => {
-            let mut sessions = if let Some(p) = path {
-                let root = std::path::PathBuf::from(p);
-                find_codex_sessions_for_dir(&root, 1).await?
-            } else {
-                find_codex_sessions_for_current_dir(1).await?
-            };
-            if let Some(s) = sessions.pop() {
-                println!("Last Codex session for current project:");
-                println!("  id: {}", s.id);
-                println!("  updated_at: {}", s.updated_at.as_deref().unwrap_or("-"));
-                println!("  cwd: {}", s.cwd.as_deref().unwrap_or("-"));
-                if let Some(msg) = s.first_user_message.as_deref() {
-                    let msg_single = msg.replace('\n', " ");
-                    // 对 last 命令，完整展示首条用户消息（仅去除换行），方便复制和回顾上下文。
-                    println!("  first_prompt: {}", msg_single);
-                }
-                println!();
-                println!("Resume with:");
-                println!("  codex resume {}", s.id);
-            } else {
-                println!("No Codex sessions found under ~/.codex/sessions");
-            }
-        }
-    }
-
+async fn handle_usage_cmd(_cmd: UsageCommand) -> CliResult<()> {
     Ok(())
 }
 
-fn truncate_for_display(s: &str, max_chars: usize) -> String {
-    let mut result = String::new();
-    let mut count = 0usize;
-    for ch in s.chars() {
-        if count >= max_chars {
-            break;
-        }
-        result.push(ch);
-        count += 1;
-    }
-    if count < s.chars().count() {
-        result.push_str("...");
-    }
-    result
+async fn handle_doctor_cmd() -> CliResult<()> {
+    Ok(())
 }
 
 async fn shutdown_signal() {
