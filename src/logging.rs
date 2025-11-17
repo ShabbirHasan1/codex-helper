@@ -59,7 +59,8 @@ pub fn log_request(
     }
 
     if let Ok(line) = serde_json::to_string(&entry)
-        && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(file, "{}", line);
-        }
+        && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path)
+    {
+        let _ = writeln!(file, "{}", line);
+    }
 }

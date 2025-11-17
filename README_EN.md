@@ -1,174 +1,278 @@
 # codex-helper (Codex CLI Local Helper / Proxy)
 
-> A Rust-based local helper / local proxy for Codex CLI traffic. It centralizes multiple upstream providers/keys/endpoints, switches safely when quotas are exhausted or endpoints fail, and ships with handy CLI tools for sessions and filtering.
+> Put Codex / Claude Code behind a small local “bumper”:  
+> centralize all your relays / keys / quotas, auto-switch when an upstream is exhausted or failing, and get handy CLI helpers for sessions, filtering, and diagnostics.
 
-> 中文说明: [README.md](README.md)
+> 中文说明: `README.md`
 
-## What can codex-helper do?
+---
 
-- **Seamlessly put Codex behind a local proxy**
-  - `codex-helper switch-on` rewrites `~/.codex/config.toml` once so that all Codex traffic goes through the local proxy;
-  - It safely backs up the original config and can restore it with `switch-off`.
+## Why codex-helper?
 
-- **Manage multiple keys / providers / relays in one place**
-  - All upstream configurations live in `~/.codex-proxy/config.json`;
-  - You can define multiple Codex configs (OpenAI, PackyCode, self-hosted relays, etc.), each with its own upstream pool;
-  - Switch which config is active via `config set-active` (then restart `codex-helper serve`—Codex sessions are persisted by Codex itself).
+codex-helper is a good fit if any of these sound familiar:
 
-- **Usage-aware routing (“auto switch when quota is exhausted”)**
-  - A pluggable “usage provider” layer can query provider quotas and mark upstreams as “exhausted”;
-  - Ships with a default provider for **PackyCode** (configured via domains, not hardcoded in LB):
-    - `~/.codex-proxy/usage_providers.json` is auto-generated with a `packycode` entry;
-    - Upstreams whose `base_url` host matches `packycode.com` are associated with this provider;
-    - The provider calls Packy’s budget API and decides whether the monthly quota is exhausted;
-    - It reuses the same token Codex uses for that upstream (or an env override).
-  - LB behavior:
-    - Normal path: prefer upstreams that are **not exhausted** and **not in cooldown**, in priority order;
-    - If all upstreams are marked exhausted: fallback mode ignores the exhausted flag and only respects failure/cooldown so there is always a last-resort upstream.
+- **You’re tired of hand-editing `~/.codex/config.toml`**  
+  Changing `model_provider` / `base_url` by hand is easy to break and annoying to restore.
 
-- **Session helpers for Codex**
-  - `codex-helper session list` scans `~/.codex/sessions` and lists recent sessions that match the current project (cwd / ancestors / descendants) first;
-  - `codex-helper session last` jumps directly to the last session for the current project and prints a ready-to-copy `codex resume <ID>` command.
+- **You juggle multiple relays / keys and switch often**  
+  You’d like OpenAI / Packy / your own relays managed in one place, and a single command to select the “current” one.
 
-- **Request filtering and structured request logging**
-  - Reads redaction/removal rules from `~/.codex-proxy/filter.json` before sending request bodies upstream;
-  - Logs every request to `~/.codex-proxy/logs/requests.jsonl` with method, path, status, duration, and usage metrics so you can inspect or aggregate with tools like `jq`.
+- **You discover exhausted quotas only after 401/429s**  
+  You’d prefer “auto-switch to a backup upstream when quota is exhausted” instead of debugging failures.
 
-- **(Experimental) Claude Code support**
-  - Can bootstrap Claude upstreams from `~/.claude/settings.json` (or `claude.json`) by reading `env.ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY` and `env.ANTHROPIC_BASE_URL`;
-  - Supports `codex-helper switch-on --claude` / `serve --claude` to point Claude Code at the local proxy, with backups and guards around `settings.json`;
-  - This behavior follows cc-switch’s directory/field conventions but is still experimental and may need adjustments as Claude evolves.
+- **You want a CLI way to quickly resume Codex sessions**  
+  For example: “show me the last session for this project and give me `codex resume <ID>`.”
 
-## Install & Run
+- **You want a local layer for redaction + logging**  
+  Requests go through a filter first, and all traffic is logged to a JSONL file for analysis and troubleshooting.
 
-### 1. Build the binary
+---
 
-From the project root:
+## Quick Start (TL;DR)
+
+### 1. Install (recommended: `cargo-binstall`)
 
 ```bash
-cargo build --release
+cargo install cargo-binstall
+cargo binstall codex-helper   # installs codex-helper and the short alias `ch`
 ```
 
-The resulting binary is at:
+This installs `codex-helper` and `ch` into your Cargo bin directory (usually `~/.cargo/bin`).  
+Make sure that directory is on your `PATH` so you can run them from anywhere.
+
+> Prefer building from source?  
+> Run `cargo build --release` and use `target/release/codex-helper` / `ch`.
+
+### 2. One-command helper for Codex (recommended)
 
 ```bash
-target/release/codex-helper
-```
-
-You may want to add it to your `PATH` so you can run `codex-helper` directly.
-
-### 2. Point Codex at the local proxy (once)
-
-Run:
-
-```bash
-codex-helper switch-on
+codex-helper
+# or shorter:
+ch
 ```
 
 This will:
 
-- Read `~/.codex/config.toml`.
-- Backup to `~/.codex/config.toml.codex-proxy-backup` if not already present.
-- Insert the following into `[model_providers]` and set `model_provider`:
+- Start a Codex proxy on `127.0.0.1:3211`;
+- Guard and, if needed, rewrite `~/.codex/config.toml` to point Codex at the local proxy (backing up the original config on first run);
+- If `~/.codex-proxy/config.json` is still empty, bootstrap a default upstream from `~/.codex/config.toml` + `auth.json`;
+- On Ctrl+C, attempt to restore the original Codex config from the backup.
 
-```toml
-[model_providers.codex_proxy]
-name = "codex-helper"
-base_url = "http://127.0.0.1:3211"
-wire_api = "responses"
+After that, you keep using your usual `codex ...` commands; codex-helper just sits in the middle.
 
-model_provider = "codex_proxy"
-```
+### 3. Optional: switch the default target to Claude (experimental)
 
-You can override the port via:
+By default, commands assume **Codex**. If you primarily use Claude Code, you can flip the default:
 
 ```bash
-codex-helper switch-on --port <PORT>
+codex-helper default --claude   # set default target service to Claude (experimental)
 ```
 
-To restore your original Codex configuration:
+After this:
+
+- `codex-helper serve` (without flags) will start a **Claude** proxy on `127.0.0.1:3210`;
+- `codex-helper config list/add/set-active` (without `--codex/--claude`) will operate on Claude configs.
+
+You can always check the current default with:
 
 ```bash
-codex-helper switch-off
+codex-helper default
 ```
 
-### 3. Start the proxy server
+---
 
-Codex (default):
+## Key capabilities
+
+- **Seamlessly put Codex behind a local proxy**  
+  - `codex-helper switch on` rewrites `~/.codex/config.toml` once so that all Codex traffic goes through the local proxy;
+  - The original config is backed up and can be restored via `codex-helper switch off`.
+
+- **Centralize multiple keys / providers / relays**  
+  - All upstream definitions live in `~/.codex-proxy/config.json`;
+  - You can define multiple Codex / Claude configs, each with its own upstream pool;
+  - Switch the active config with `codex-helper config set-active`, then restart or re-run `codex-helper`.
+
+- **Usage-aware routing (“auto-switch when quota is exhausted”)**  
+  - A pluggable usage provider layer can mark upstreams as “exhausted” when quotas are out;
+  - Ships with a default provider for **Packy** (configured via domains, not hardcoded);
+  - LB prefers non-exhausted, non-cooled-down upstreams, with a fallback mode that always keeps at least one upstream usable.
+
+- **Session helpers for Codex**  
+  - `codex-helper session list` scans `~/.codex/sessions` and prefers sessions whose `cwd` matches the current project (cwd / parents / children);
+  - `codex-helper session last` prints the last session for the current project plus a ready-to-copy `codex resume <ID>` command.
+
+- **Request filtering and structured request logging**  
+  - Redaction/removal rules from `~/.codex-proxy/filter.json` are applied to request bodies before sending upstream;
+  - Every request is logged to `~/.codex-proxy/logs/requests.jsonl` with method, path, status, duration, and usage metrics.
+
+- **(Experimental) Claude Code support**  
+  - Can bootstrap Claude upstreams from `~/.claude/settings.json` (or `claude.json`) by reading `env.ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL`;
+  - Supports `codex-helper switch on --claude` / `serve --claude` to point Claude Code at the local proxy, with backups and guards around `settings.json`;
+  - Behavior may evolve as Claude’s config format changes.
+
+---
+
+## Command cheatsheet
+
+### Daily use
+
+- Start Codex helper (recommended):
+  - `codex-helper` / `ch`
+- Explicit Codex / Claude proxy:
+  - `codex-helper serve` (Codex, default port 3211)
+  - `codex-helper serve --codex`
+  - `codex-helper serve --claude` (Claude, default port 3210)
+
+### Turn Codex / Claude on/off via local proxy
+
+- Switch Codex / Claude to the local proxy:
+
+  ```bash
+  codex-helper switch on          # Codex
+  codex-helper switch on --claude # Claude (experimental)
+  ```
+
+- Restore original configs from backup:
+
+  ```bash
+  codex-helper switch off
+  codex-helper switch off --claude
+  ```
+
+- Inspect current switch status:
+
+  ```bash
+  codex-helper switch status
+  codex-helper switch status --codex
+  codex-helper switch status --claude
+  ```
+
+### Manage upstream configs (providers / relays)
+
+- List configs (defaults to Codex, can target Claude explicitly):
+
+  ```bash
+  codex-helper config list
+  codex-helper config list --claude
+  ```
+
+- Add a new config:
+
+  ```bash
+  # Codex
+  codex-helper config add openai-main \
+    --base-url https://api.openai.com/v1 \
+    --auth-token sk-openai-xxx \
+    --alias "Main OpenAI quota"
+
+  # Claude (experimental)
+  codex-helper config add claude-main \
+    --base-url https://api.anthropic.com/v1 \
+    --auth-token sk-claude-yyy \
+    --alias "Claude main quota" \
+    --claude
+  ```
+
+- Set the active config:
+
+  ```bash
+  codex-helper config set-active openai-main
+  codex-helper config set-active claude-main --claude
+  ```
+
+### Sessions, usage, diagnostics
+
+- Session helpers (Codex):
+
+  ```bash
+  codex-helper session list
+  codex-helper session last
+  ```
+
+- Usage & logs:
+
+  ```bash
+  codex-helper usage summary
+  codex-helper usage tail --limit 20 --raw
+  ```
+
+- Status & doctor:
+
+  ```bash
+  codex-helper status
+  codex-helper doctor
+
+  # JSON outputs for scripts / UI integration
+  codex-helper status --json | jq .
+  codex-helper doctor --json | jq '.checks[] | select(.status != "ok")'
+  ```
+
+---
+
+## Example workflows
+
+### Scenario 1: Manage multiple relays / keys and switch quickly
 
 ```bash
-codex-helper serve
-codex-helper serve --port 3211
+# 1. Add configs for different providers
+codex-helper config add openai-main \
+  --base-url https://api.openai.com/v1 \
+  --auth-token sk-openai-xxx \
+  --alias "Main OpenAI quota"
+
+codex-helper config add packy-main \
+  --base-url https://codex-api.packycode.com/v1 \
+  --auth-token sk-packy-yyy \
+  --alias "Packy relay"
+
+codex-helper config list
+
+# 2. Select which config is active
+codex-helper config set-active openai-main   # use OpenAI
+codex-helper config set-active packy-main    # use Packy
+
+# 3. Point Codex at the local proxy (once)
+codex-helper switch on
+
+# 4. Start the proxy with the current active config
+codex-helper
 ```
 
-On startup:
-
-- The proxy listens on `127.0.0.1:<port>`.
-- In Codex mode, on first run it bootstraps a default upstream from `~/.codex`:
-  - Uses the current `model_provider`.
-  - Resolves its `env_key` / `auth.json` into an upstream `auth_token`:
-    - Prefer the provider's `env_key` (environment variable and `auth.json` field);
-    - If no `env_key` is declared and `auth.json` contains a single `*_API_KEY` field (for example `OPENAI_API_KEY`), that field is treated as the upstream token.
-- If it cannot resolve a valid token for Codex upstreams, the process fails fast with an error.
-
-### 4. Session helpers (Codex)
-
-List recent sessions for the current project:
+### Scenario 2: Resume Codex sessions by project
 
 ```bash
-codex-helper session list
-codex-helper session list --limit 20
+cd ~/code/my-app
+
+codex-helper session list   # list recent sessions for this project
+codex-helper session last   # show last session + a codex resume command
 ```
 
-- Reads `~/.codex/sessions/**/rollout-*.jsonl`.
-- Prefers sessions whose recorded `cwd` matches the current directory, one of its ancestors, or one of its descendants.
-- Displays:
-  - `id` (full, on its own line for easy copy).
-  - `updated` (last activity timestamp).
-  - `cwd` (session working directory).
-  - `prompt` (short preview of the first user message).
-
-Jump directly to the last session for the current project:
+You can also query sessions for any directory without cd:
 
 ```bash
-codex-helper session last
+codex-helper session list --path ~/code/my-app
+codex-helper session last --path ~/code/my-app
 ```
 
-Example output:
+This is especially handy when juggling multiple side projects: you don’t need to remember session IDs, just tell codex-helper which directory you care about and it will find the most relevant sessions and suggest `codex resume <ID>`.
 
-```text
-Last Codex session for current project:
-  id: 1234-...-abcd
-  updated_at: 2025-04-01T10:30:00Z
-  cwd: /Users/you/project
-  first_prompt: your first message ...
+---
 
-Resume with:
-  codex resume 1234-...-abcd
-```
+## Advanced configuration (optional)
 
-## Configuration & Pools
-
-### Files
+Most users do not need to touch these. If you want deeper customization, these files are relevant:
 
 - Main config: `~/.codex-proxy/config.json`
-  - Contains `codex` configurations (either added manually or imported from Codex CLI config).
 - Filter rules: `~/.codex-proxy/filter.json`
 - Usage providers: `~/.codex-proxy/usage_providers.json`
 - Request logs: `~/.codex-proxy/logs/requests.jsonl`
 
-Codex official config files:
+Codex official files:
 
-- Auth: `~/.codex/auth.json`
-  - Managed by `codex login` and other Codex commands.
-  - codex-helper only reads this file; it never modifies it automatically.
-  - When no `env_key` is declared for the current provider and there is exactly one `*_API_KEY` field (for example `OPENAI_API_KEY`), that field is treated as the upstream token.
-- Behavior/config: `~/.codex/config.toml`
-  - Managed by Codex CLI.
-  - `codex-helper switch-on` backs it up and then points `model_provider` to the local proxy `codex_proxy`.
-  - You can explicitly import a default upstream derived from this file (plus `auth.json`) into `~/.codex-proxy/config.json` via `codex-helper config import-from-codex`.
+- `~/.codex/auth.json`: managed by `codex login`; codex-helper only reads it.
+- `~/.codex/config.toml`: managed by Codex CLI; codex-helper touches it only via `switch on/off`.
 
-### `config.json` layout (brief)
+### `config.json` structure (brief)
 
 ```jsonc
 {
@@ -197,42 +301,15 @@ Codex official config files:
 }
 ```
 
-- `name`: config ID (map key).
-- `alias`: optional display name.
-- `upstreams`: upstream pool (order = priority):
-  - `base_url`: upstream API base URL.
-  - `auth.auth_token`: used as `Authorization: Bearer <token>`.
-  - `auth.api_key`: optional extra API key header.
-  - `tags`: optional metadata (e.g., provenance).
+Key ideas:
 
-### CLI configuration commands
-
-List configs:
-
-```bash
-codex-helper config list
-```
-
-Add a new config:
-
-```bash
-codex-helper config add openai-main \
-  --base-url https://api.openai.com/v1 \
-  --auth-token sk-xxx \
-  --alias "Main OpenAI quota"
-```
-
-Set active config:
-
-```bash
-codex-helper config set-active openai-main
-```
-
-## Usage Providers
+- `active`: the name of the currently active config;
+- `configs`: a map of named configs;
+- each `upstream` is one endpoint, ordered by priority (primary → backups).
 
 ### `usage_providers.json`
 
-Path: `~/.codex-proxy/usage_providers.json`. If it does not exist, the proxy will create a default file similar to:
+Path: `~/.codex-proxy/usage_providers.json`. If it does not exist, codex-helper will write a default file similar to:
 
 ```jsonc
 {
@@ -249,110 +326,58 @@ Path: `~/.codex-proxy/usage_providers.json`. If it does not exist, the proxy wil
 }
 ```
 
-Fields:
+For `budget_http_json`:
 
-- `id`: provider ID (for logging / distinction).
-- `kind`: currently `budget_http_json`:
-  - Expects a JSON response with budget/spent fields and determines whether the quota is exhausted.
-- `domains`: any upstream whose `base_url` host matches one of these domains is associated with this provider.
-- `endpoint`: usage API endpoint.
-- `token_env`: optional env var name to override the token.
-- `poll_interval_secs`: polling interval in seconds (default 60).
+- up to date usage is obtained by calling `endpoint` with a Bearer token (from `token_env` or the associated upstream’s `auth_token`);
+- the response is inspected for fields like `monthly_budget_usd` / `monthly_spent_usd` to decide if the quota is exhausted;
+- associated upstreams are then marked `usage_exhausted = true` in LB state; when possible, LB avoids these upstreams.
 
-### Token resolution
+### Filtering & logging
 
-For each provider:
+- Filter rules: `~/.codex-proxy/filter.json`, e.g.:
 
-1. If `token_env` is set and the env var is non-empty, that value is used.
-2. Otherwise, it scans associated upstreams and takes the first non-empty `auth.auth_token` as its Bearer token.
+  ```jsonc
+  [
+    { "op": "replace", "source": "your-company.com", "target": "[REDACTED_DOMAIN]" },
+    { "op": "remove",  "source": "super-secret-token" }
+  ]
+  ```
 
-This means that for the common case of a single token:
+  Filters are applied to the request body before sending it upstream; rules are reloaded based on file mtime.
 
-- Whatever token Codex uses to talk to that upstream (e.g., Packy) is reused for the usage API, without needing a separate token.
+- Logs: `~/.codex-proxy/logs/requests.jsonl`, each line is a JSON object like:
 
-### Impact on LB
-
-- For `budget_http_json`:
-  - The provider reads `monthly_budget_usd` and `monthly_spent_usd` from the JSON response.
-  - If `monthly_budget_usd > 0` and `monthly_spent_usd >= monthly_budget_usd`, the provider treats the quota as exhausted.
-- All associated upstreams then get `usage_exhausted = true` in the LB state.
-- LB behavior:
-  - Normal path:
-    - Excludes upstreams that are:
-      - In failure cooldown, or
-      - Marked as `usage_exhausted`.
-  - Fallback path:
-    - If all upstreams are marked exhausted, the LB ignores `usage_exhausted` and only respects failure/cooldown.
-    - This ensures there is always an upstream to fall back to.
-
-## Request Filtering & Logging
-
-### Filtering: `~/.codex-proxy/filter.json`
-
-Example:
-
-```jsonc
-[
-  { "op": "replace", "source": "your-company.com", "target": "[REDACTED_DOMAIN]" },
-  { "op": "remove",  "source": "super-secret-token" }
-]
-```
-
-- Filters are applied to the request body before sending it upstream.
-- The file is monitored via mtime; updates are picked up within about one second.
-
-### Logging: `~/.codex-proxy/logs/requests.jsonl`
-
-Each line is a JSON object, e.g.:
-
-```jsonc
-{
-  "timestamp_ms": 1730000000000,
-  "service": "codex",
-  "method": "POST",
-  "path": "/v1/responses",
-  "status_code": 200,
-  "duration_ms": 1234,
-  "config_name": "openai-main",
-  "upstream_base_url": "https://api.openai.com/v1",
-  "usage": {
-    "input_tokens": 123,
-    "output_tokens": 456,
-    "reasoning_tokens": 0,
-    "total_tokens": 579
+  ```jsonc
+  {
+    "timestamp_ms": 1730000000000,
+    "service": "codex",
+    "method": "POST",
+    "path": "/v1/responses",
+    "status_code": 200,
+    "duration_ms": 1234,
+    "config_name": "openai-main",
+    "upstream_base_url": "https://api.openai.com/v1",
+    "usage": {
+      "input_tokens": 123,
+      "output_tokens": 456,
+      "reasoning_tokens": 0,
+      "total_tokens": 579
+    }
   }
-}
-```
+  ```
 
-The fields above form a **stable contract** for tooling: future versions will only add fields, not remove or rename the existing ones. This makes it safe to build scripts and dashboards on top of `requests.jsonl`.
+These fields form a **stable contract**: future versions will only add fields, not remove or rename existing ones, so you can safely build scripts and dashboards on top of them.
 
-You can use tools like `jq` to aggregate usage by config, upstream, or time window. For example:
-
-```bash
-# Aggregate total_tokens by config_name from the last 100 entries
-codex-helper usage tail --limit 100 --raw \
-  | jq -s 'group_by(.config_name) | map({config: .[0].config_name, total: (map(.usage.total_tokens // 0) | add)})'
-```
-
-You can also use the built-in helpers:
-
-```bash
-codex-helper usage summary
-codex-helper usage tail --limit 20 --raw
-```
-
-For high-level status and environment diagnostics:
-
-```bash
-# Human-friendly views
-codex-helper status
-codex-helper doctor
-
-# JSON views for scripts / UI integration
-codex-helper status --json | jq .
-codex-helper doctor --json | jq '.checks[] | select(.status != "ok")'
-```
+---
 
 ## Relationship to cli_proxy and cc-switch
 
-codex-helper is inspired by, and designed to work well alongside, both [cli_proxy](https://github.com/guojinpeng/cli_proxy) and [cc-switch](https://github.com/farion1231/cc-switch), but focuses on being a lightweight, Rust-based local proxy and config manager specifically for Codex CLI traffic.
+- [cli_proxy](https://github.com/guojinpeng/cli_proxy): a multi-service daemon + Web UI with a broader scope (Codex, Claude, etc.) and centralized monitoring.
+- [cc-switch](https://github.com/farion1231/cc-switch): a desktop GUI supplier/MCP manager focused on “manage configs in one place, apply to many clients”.
+
+codex-helper takes inspiration from both, but stays deliberately lightweight:
+
+- focused on Codex CLI (with experimental Claude support);
+- single binary, no daemon, no Web UI;
+- designed to be a small CLI companion you can run ad hoc, or embed into your own scripts and tooling.
+

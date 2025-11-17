@@ -49,9 +49,7 @@ impl LoadBalancer {
         }
 
         let mut map = self.states.lock().expect("lb state mutex poisoned");
-        let entry = map
-            .entry(self.service.name.clone())
-            .or_default();
+        let entry = map.entry(self.service.name.clone()).or_default();
         entry.ensure_len(self.service.upstreams.len());
 
         let now = std::time::Instant::now();
@@ -59,12 +57,13 @@ impl LoadBalancer {
         // 更新冷却状态：如果冷却期已过，重置失败计数和冷却时间。
         for idx in 0..self.service.upstreams.len() {
             if let Some(until) = entry.cooldown_until.get(idx).and_then(|v| *v)
-                && now >= until {
-                    entry.failure_counts[idx] = 0;
-                    if let Some(slot) = entry.cooldown_until.get_mut(idx) {
-                        *slot = None;
-                    }
+                && now >= until
+            {
+                entry.failure_counts[idx] = 0;
+                if let Some(slot) = entry.cooldown_until.get_mut(idx) {
+                    *slot = None;
                 }
+            }
         }
 
         // 第一轮：按顺序选择第一个「未熔断 + 未标记用量用尽」的 upstream。
@@ -143,11 +142,11 @@ impl LoadBalancer {
         } else {
             entry.failure_counts[index] = entry.failure_counts[index].saturating_add(1);
             if entry.failure_counts[index] >= FAILURE_THRESHOLD
-                && let Some(slot) = entry.cooldown_until.get_mut(index) {
-                    *slot = Some(
-                        std::time::Instant::now() + std::time::Duration::from_secs(COOLDOWN_SECS),
-                    );
-                }
+                && let Some(slot) = entry.cooldown_until.get_mut(index)
+            {
+                *slot =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(COOLDOWN_SECS));
+            }
         }
     }
 }

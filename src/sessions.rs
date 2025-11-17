@@ -117,21 +117,24 @@ async fn summarize_session_for_current_dir(
         };
 
         if last_timestamp.is_none()
-            && let Some(ts) = value.get("timestamp").and_then(|v| v.as_str()) {
-                last_timestamp = Some(ts.to_string());
-            }
+            && let Some(ts) = value.get("timestamp").and_then(|v| v.as_str())
+        {
+            last_timestamp = Some(ts.to_string());
+        }
 
         if session_id.is_none()
-            && let Some(meta) = parse_session_meta(&value) {
-                session_id = Some(meta.id);
-                cwd_str = meta.cwd;
-                created_at = meta.created_at;
-            }
+            && let Some(meta) = parse_session_meta(&value)
+        {
+            session_id = Some(meta.id);
+            cwd_str = meta.cwd;
+            created_at = meta.created_at;
+        }
 
         if first_user_message.is_none()
-            && let Some(msg) = parse_user_message(&value) {
-                first_user_message = Some(msg);
-            }
+            && let Some(msg) = parse_user_message(&value)
+        {
+            first_user_message = Some(msg);
+        }
     }
 
     let id = match session_id {

@@ -11,6 +11,14 @@ categories = ["command-line-utilities", "development-tools", "asynchronous"]
 repository = "https://github.com/Latias94/codex-helper"
 homepage = "https://github.com/Latias94/codex-helper"
 
+[[bin]]
+name = "codex-helper"
+path = "src/main.rs"
+
+[[bin]]
+name = "ch"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0.93"
 serde = { version = "1.0.214", features = ["derive"] }

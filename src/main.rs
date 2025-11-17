@@ -19,7 +19,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{ServiceKind, load_or_bootstrap_for_service};
+use crate::config::{
+    ServiceKind, claude_settings_backup_path, claude_settings_path, codex_backup_config_path,
+    codex_config_path, load_config, load_or_bootstrap_for_service,
+};
 use crate::proxy::{ProxyService, router as proxy_router};
 
 #[derive(Parser, Debug)]
@@ -67,17 +70,23 @@ impl From<anyhow::Error> for CliError {
 enum Command {
     /// Start HTTP proxy server (default Codex; use --claude for Claude)
     Serve {
-        /// Listen port; defaults to 3211 for Codex, 3210 for Claude
-        #[arg(long)]
-        port: Option<u16>,
-        /// Use Codex service (default if neither flag is set)
+        /// Target Codex service (default if neither flag is set)
         #[arg(long)]
         codex: bool,
-        /// Use Claude service (experimental; config must be provided manually)
+        /// Target Claude service (experimental)
         #[arg(long)]
         claude: bool,
+        /// Listen port (3211 for Codex, 3210 for Claude by default)
+        #[arg(long)]
+        port: Option<u16>,
     },
-    /// Patch ~/.codex/config.toml to use local proxy
+    /// Manage Codex/Claude switch-on/off state
+    Switch {
+        #[command(subcommand)]
+        cmd: SwitchCommand,
+    },
+    /// Legacy: patch ~/.codex/config.toml to use local proxy (use `switch on` instead)
+    #[command(hide = true)]
     SwitchOn {
         #[arg(long, default_value_t = 3211)]
         port: u16,
@@ -88,7 +97,8 @@ enum Command {
         #[arg(long)]
         claude: bool,
     },
-    /// Restore ~/.codex/config.toml from backup
+    /// Legacy: restore ~/.codex/config.toml from backup (use `switch off` instead)
+    #[command(hide = true)]
     SwitchOff {
         /// Target Codex config (default)
         #[arg(long)]
@@ -123,6 +133,49 @@ enum Command {
     Usage {
         #[command(subcommand)]
         cmd: UsageCommand,
+    },
+    /// Get or set the default target service (Codex/Claude) used by other commands
+    Default {
+        /// Set default to Codex
+        #[arg(long)]
+        codex: bool,
+        /// Set default to Claude (experimental)
+        #[arg(long)]
+        claude: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SwitchCommand {
+    /// Switch Codex/Claude config to use local proxy
+    On {
+        /// Listen port for local proxy; defaults to 3211
+        #[arg(long, default_value_t = 3211)]
+        port: u16,
+        /// Target Codex config (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude settings (experimental)
+        #[arg(long)]
+        claude: bool,
+    },
+    /// Restore Codex/Claude config from backup (if present)
+    Off {
+        /// Target Codex config (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude settings (experimental)
+        #[arg(long)]
+        claude: bool,
+    },
+    /// Show current switch status for Codex/Claude
+    Status {
+        /// Show Codex switch status
+        #[arg(long)]
+        codex: bool,
+        /// Show Claude switch status
+        #[arg(long)]
+        claude: bool,
     },
 }
 
@@ -230,43 +283,40 @@ async fn real_main() -> CliResult<()> {
         codex: false,
         claude: false,
     }) {
+        Command::Default { codex, claude } => {
+            handle_default_cmd(codex, claude).await?;
+            return Ok(());
+        }
+        Command::Switch { cmd } => {
+            match cmd {
+                SwitchCommand::On {
+                    port,
+                    codex,
+                    claude,
+                } => do_switch_on(port, codex, claude)?,
+                SwitchCommand::Off { codex, claude } => do_switch_off(codex, claude)?,
+                SwitchCommand::Status { codex, claude } => do_switch_status(codex, claude),
+            }
+            return Ok(());
+        }
         Command::SwitchOn {
             port,
             codex,
             claude,
         } => {
-            if codex && claude {
-                return Err(CliError::Other(
-                    "Please specify at most one of --codex / --claude".to_string(),
-                ));
-            }
-            if claude {
-                if let Err(err) =
-                    codex_integration::guard_claude_settings_before_switch_on_interactive()
-                {
-                    tracing::warn!("Failed to guard Claude settings before switch-on: {}", err);
-                }
-                codex_integration::claude_switch_on(port)?;
-            } else {
-                codex_integration::guard_codex_config_before_switch_on_interactive()?;
-                codex_integration::switch_on(port)
-                    .map_err(|e| CliError::CodexConfig(e.to_string()))?;
-            }
+            eprintln!(
+                "{}",
+                "Warning: `switch-on` is deprecated, please use `switch on` instead.".yellow()
+            );
+            do_switch_on(port, codex, claude)?;
             return Ok(());
         }
         Command::SwitchOff { codex, claude } => {
-            if codex && claude {
-                return Err(CliError::Other(
-                    "Please specify at most one of --codex / --claude".to_string(),
-                ));
-            }
-            if claude {
-                codex_integration::claude_switch_off()
-                    .map_err(|e| CliError::CodexConfig(e.to_string()))?;
-            } else {
-                codex_integration::switch_off()
-                    .map_err(|e| CliError::CodexConfig(e.to_string()))?;
-            }
+            eprintln!(
+                "{}",
+                "Warning: `switch-off` is deprecated, please use `switch off` instead.".yellow()
+            );
+            do_switch_off(codex, claude)?;
             return Ok(());
         }
         Command::Config { cmd } => {
@@ -291,11 +341,35 @@ async fn real_main() -> CliResult<()> {
         }
         Command::Serve {
             port,
-            codex: _,
+            codex,
             claude,
         } => {
-            // 默认使用 Codex；如显式指定 --claude 则切换到 Claude。
-            let service_name = if claude { "claude" } else { "codex" };
+            if codex && claude {
+                return Err(CliError::Other(
+                    "Please specify at most one of --codex / --claude".to_string(),
+                ));
+            }
+
+            // 显式指定优先；否则根据配置中的 default_service 决定默认服务（缺省为 Codex）。
+            let service_name = if claude {
+                "claude"
+            } else if codex {
+                "codex"
+            } else {
+                match load_config().await {
+                    Ok(cfg) => match cfg.default_service {
+                        Some(ServiceKind::Claude) => "claude",
+                        _ => "codex",
+                    },
+                    Err(err) => {
+                        tracing::warn!(
+                            "Failed to load config for default service, falling back to Codex: {}",
+                            err
+                        );
+                        "codex"
+                    }
+                }
+            };
             let port = port.unwrap_or_else(|| if service_name == "codex" { 3211 } else { 3210 });
             run_server(service_name, port)
                 .await
@@ -353,12 +427,13 @@ async fn run_server(service_name: &'static str, port: u16) -> anyhow::Result<()>
             );
         }
     } else if service_name == "claude"
-        && (cfg.claude.configs.is_empty() || cfg.claude.active_config().is_none()) {
-            anyhow::bail!(
-                "未找到任何可用的 Claude 上游配置，请先确保 ~/.claude/settings.json 配置完整，\
+        && (cfg.claude.configs.is_empty() || cfg.claude.active_config().is_none())
+    {
+        anyhow::bail!(
+            "未找到任何可用的 Claude 上游配置，请先确保 ~/.claude/settings.json 配置完整，\
 或在 ~/.codex-proxy/config.json 的 `claude` 段下手动添加上游配置"
-            );
-        }
+        );
+    }
     let client = Client::builder().build()?;
 
     // 统一的 LB 状态（失败计数、冷却、用量状态）
@@ -385,16 +460,237 @@ async fn run_server(service_name: &'static str, port: u16) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn handle_session_cmd(_cmd: SessionCommand) -> CliResult<()> {
+fn do_switch_on(port: u16, codex: bool, claude: bool) -> CliResult<()> {
+    if codex && claude {
+        return Err(CliError::Other(
+            "Please specify at most one of --codex / --claude".to_string(),
+        ));
+    }
+    if claude {
+        if let Err(err) = codex_integration::guard_claude_settings_before_switch_on_interactive() {
+            tracing::warn!("Failed to guard Claude settings before switch-on: {}", err);
+        }
+        codex_integration::claude_switch_on(port)
+            .map_err(|e| CliError::CodexConfig(e.to_string()))?;
+    } else {
+        codex_integration::guard_codex_config_before_switch_on_interactive()?;
+        codex_integration::switch_on(port).map_err(|e| CliError::CodexConfig(e.to_string()))?;
+    }
     Ok(())
 }
 
-async fn handle_usage_cmd(_cmd: UsageCommand) -> CliResult<()> {
+fn do_switch_off(codex: bool, claude: bool) -> CliResult<()> {
+    if codex && claude {
+        return Err(CliError::Other(
+            "Please specify at most one of --codex / --claude".to_string(),
+        ));
+    }
+    if claude {
+        codex_integration::claude_switch_off().map_err(|e| CliError::CodexConfig(e.to_string()))?;
+    } else {
+        codex_integration::switch_off().map_err(|e| CliError::CodexConfig(e.to_string()))?;
+    }
     Ok(())
 }
 
-async fn handle_doctor_cmd() -> CliResult<()> {
+fn do_switch_status(codex_flag: bool, claude_flag: bool) {
+    let both_unspecified = !codex_flag && !claude_flag;
+    let show_codex = codex_flag || both_unspecified;
+    let show_claude = claude_flag || both_unspecified;
+
+    if show_codex {
+        print_codex_switch_status();
+        if show_claude {
+            println!();
+        }
+    }
+    if show_claude {
+        print_claude_switch_status();
+    }
+}
+
+async fn handle_default_cmd(codex: bool, claude: bool) -> CliResult<()> {
+    if codex && claude {
+        return Err(CliError::Other(
+            "Please specify at most one of --codex / --claude".to_string(),
+        ));
+    }
+
+    let mut cfg = load_config()
+        .await
+        .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+
+    if codex || claude {
+        cfg.default_service = Some(if claude {
+            ServiceKind::Claude
+        } else {
+            ServiceKind::Codex
+        });
+        crate::config::save_config(&cfg)
+            .await
+            .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+
+        let name = if claude { "Claude" } else { "Codex" };
+        println!("Default target service has been set to {}.", name);
+    } else {
+        let name = match cfg.default_service {
+            Some(ServiceKind::Claude) => "Claude",
+            _ => "Codex",
+        };
+        println!("Current default target service: {}.", name);
+    }
+
     Ok(())
+}
+
+fn print_codex_switch_status() {
+    use std::fs;
+
+    let cfg_path = codex_config_path();
+    let backup_path = codex_backup_config_path();
+
+    println!("{}", "Codex 开关状态".bold());
+    println!("  配置文件路径: {:?}", cfg_path);
+
+    if !cfg_path.exists() {
+        println!(
+            "  当前未检测到 {:?}，可能尚未安装或初始化 Codex CLI。",
+            cfg_path
+        );
+        return;
+    }
+
+    let text = match fs::read_to_string(&cfg_path) {
+        Ok(t) => t,
+        Err(err) => {
+            println!("  无法读取配置文件：{}", err.to_string().red());
+            return;
+        }
+    };
+
+    let value: toml::Value = match text.parse() {
+        Ok(v) => v,
+        Err(err) => {
+            println!("  无法解析配置为 TOML：{}", err.to_string().red());
+            return;
+        }
+    };
+
+    let table = match value.as_table() {
+        Some(t) => t,
+        None => {
+            println!("  配置根节点不是 TOML 表，无法解析 model_provider。");
+            return;
+        }
+    };
+
+    let provider = table
+        .get("model_provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<未设置>");
+    println!("  当前 model_provider: {}", provider.bold());
+
+    if provider == "codex_proxy" {
+        if let Some(providers) = table.get("model_providers").and_then(|v| v.as_table()) {
+            if let Some(proxy) = providers.get("codex_proxy").and_then(|v| v.as_table()) {
+                let base_url = proxy.get("base_url").and_then(|v| v.as_str()).unwrap_or("");
+                let name = proxy.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                println!("  codex_proxy.name: {}", name);
+                println!("  codex_proxy.base_url: {}", base_url);
+
+                let is_local = base_url.contains("127.0.0.1") || base_url.contains("localhost");
+                if is_local {
+                    println!("  -> 当前 Codex 已指向本地 codex-helper 代理。");
+                }
+            }
+        }
+    }
+
+    if backup_path.exists() {
+        println!(
+            "  已检测到备份文件：{:?}（switch-off 将尝试从此处恢复）",
+            backup_path
+        );
+    } else {
+        println!(
+            "  未检测到备份文件：{:?}，如直接修改过 config.toml，建议手动备份。",
+            backup_path
+        );
+    }
+}
+
+fn print_claude_switch_status() {
+    use serde_json::Value as JsonValue;
+    use std::fs;
+
+    let settings_path = claude_settings_path();
+    let backup_path = claude_settings_backup_path();
+
+    println!("{}", "Claude 开关状态（实验性）".bold());
+    println!("  配置文件路径: {:?}", settings_path);
+
+    if !settings_path.exists() {
+        println!(
+            "  当前未检测到 Claude 配置文件 {:?}，可能尚未安装或初始化 Claude Code。",
+            settings_path
+        );
+        return;
+    }
+
+    let text = match fs::read_to_string(&settings_path) {
+        Ok(t) => t,
+        Err(err) => {
+            println!("  无法读取配置文件：{}", err.to_string().red());
+            return;
+        }
+    };
+
+    let value: JsonValue = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(err) => {
+            println!("  无法解析配置为 JSON：{}", err.to_string().red());
+            return;
+        }
+    };
+
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => {
+            println!("  配置根节点不是 JSON 对象，无法解析 env 字段。");
+            return;
+        }
+    };
+
+    let env_obj = match obj.get("env").and_then(|v| v.as_object()) {
+        Some(e) => e,
+        None => {
+            println!("  未检测到 env 字段，可能不是标准的 Claude 配置结构。");
+            return;
+        }
+    };
+
+    let base_url = env_obj
+        .get("ANTHROPIC_BASE_URL")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<未设置>");
+    println!("  ANTHROPIC_BASE_URL: {}", base_url.bold());
+
+    let is_local = base_url.contains("127.0.0.1") || base_url.contains("localhost");
+    if is_local {
+        println!("  -> 当前 Claude 已指向本地 codex-helper 代理。");
+    }
+
+    if backup_path.exists() {
+        println!(
+            "  已检测到备份文件：{:?}（switch off --claude 将尝试从此处恢复）",
+            backup_path
+        );
+    } else {
+        println!(
+            "  未检测到备份文件：{:?}，如直接修改过 settings.json/claude.json，建议手动备份。",
+            backup_path
+        );
+    }
 }
 
 async fn shutdown_signal() {

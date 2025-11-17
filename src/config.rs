@@ -73,6 +73,9 @@ pub struct ProxyConfig {
     /// Claude Code 等其他服务配置，后续扩展
     #[serde(default)]
     pub claude: ServiceConfigManager,
+    /// 默认目标服务（用于 CLI 默认选择 codex/claude）
+    #[serde(default)]
+    pub default_service: Option<ServiceKind>,
 }
 
 fn config_dir() -> PathBuf {
@@ -120,9 +123,10 @@ pub async fn save_config(cfg: &ProxyConfig) -> Result<()> {
 
     // 先备份旧文件（若存在），再采用临时文件 + rename 方式原子写入，尽量避免配置损坏。
     if path.exists()
-        && let Err(err) = fs::copy(&path, &backup_path).await {
-            warn!("failed to backup {:?} to {:?}: {}", path, backup_path, err);
-        }
+        && let Err(err) = fs::copy(&path, &backup_path).await
+    {
+        warn!("failed to backup {:?} to {:?}: {}", path, backup_path, err);
+    }
 
     let tmp_path = dir.join("config.json.tmp");
     fs::write(&tmp_path, &data).await?;
@@ -180,7 +184,7 @@ fn claude_home() -> PathBuf {
         .join(".claude")
 }
 
-fn claude_settings_path() -> PathBuf {
+pub fn claude_settings_path() -> PathBuf {
     let dir = claude_home();
     let settings = dir.join("settings.json");
     if settings.exists() {
@@ -193,7 +197,7 @@ fn claude_settings_path() -> PathBuf {
     settings
 }
 
-fn claude_settings_backup_path() -> PathBuf {
+pub fn claude_settings_backup_path() -> PathBuf {
     let mut path = claude_settings_path();
     let file_name = path
         .file_name()
@@ -209,7 +213,8 @@ pub fn codex_sessions_dir() -> PathBuf {
 }
 
 /// 支持的上游服务类型：Codex / Claude。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum ServiceKind {
     Codex,
     Claude,
@@ -225,15 +230,17 @@ fn read_file_if_exists(path: &Path) -> Result<Option<String>> {
 
 fn resolve_auth_token(env_key: &str, auth_json: &Option<JsonValue>) -> Option<String> {
     if let Ok(val) = env::var(env_key)
-        && !val.trim().is_empty() {
-            return Some(val);
-        }
+        && !val.trim().is_empty()
+    {
+        return Some(val);
+    }
     if let Some(json) = auth_json
         && let Some(obj) = json.as_object()
-            && let Some(v) = obj.get(env_key).and_then(|v| v.as_str())
-                && !v.trim().is_empty() {
-                    return Some(v.to_string());
-                }
+        && let Some(v) = obj.get(env_key).and_then(|v| v.as_str())
+        && !v.trim().is_empty()
+    {
+        return Some(v.to_string());
+    }
     None
 }
 
@@ -350,15 +357,17 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
         .as_deref()
         .and_then(|key| resolve_auth_token(key, &auth_json));
 
-    if auth_token.is_none() && effective_env_key.is_none()
-        && let Some((inferred_key, inferred_token)) = infer_env_key_from_auth_json(&auth_json) {
-            info!(
-                "当前 model_provider 未声明 env_key，已从 ~/.codex/auth.json 自动推断为 `{}`",
-                inferred_key
-            );
-            effective_env_key = Some(inferred_key);
-            auth_token = Some(inferred_token);
-        }
+    if auth_token.is_none()
+        && effective_env_key.is_none()
+        && let Some((inferred_key, inferred_token)) = infer_env_key_from_auth_json(&auth_json)
+    {
+        info!(
+            "当前 model_provider 未声明 env_key，已从 ~/.codex/auth.json 自动推断为 `{}`",
+            inferred_key
+        );
+        effective_env_key = Some(inferred_key);
+        auth_token = Some(inferred_token);
+    }
 
     if auth_token.is_none() {
         if let Some(key) = effective_env_key.as_deref() {

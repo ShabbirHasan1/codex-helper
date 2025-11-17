@@ -1,21 +1,36 @@
 use crate::config::{
-    ServiceConfig, UpstreamAuth, UpstreamConfig, import_codex_config_from_codex_cli, load_config,
-    save_config,
+    ServiceConfig, ServiceKind, UpstreamAuth, UpstreamConfig, import_codex_config_from_codex_cli,
+    load_config, save_config,
 };
 use crate::{CliError, CliResult, ConfigCommand};
 
-fn resolve_service(codex: bool, claude: bool) -> anyhow::Result<&'static str> {
+async fn resolve_service(codex: bool, claude: bool) -> anyhow::Result<&'static str> {
     if codex && claude {
         anyhow::bail!("Please specify at most one of --codex / --claude");
     }
-    if claude { Ok("claude") } else { Ok("codex") }
+    if codex {
+        return Ok("codex");
+    }
+    if claude {
+        return Ok("claude");
+    }
+
+    // 未显式指定时，根据配置中的 default_service 决定默认服务（缺省为 Codex）。
+    match load_config().await {
+        Ok(cfg) => match cfg.default_service {
+            Some(ServiceKind::Claude) => Ok("claude"),
+            _ => Ok("codex"),
+        },
+        Err(_) => Ok("codex"),
+    }
 }
 
 pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
     match cmd {
         ConfigCommand::List { codex, claude } => {
-            let service =
-                resolve_service(codex, claude).map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let service = resolve_service(codex, claude)
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             let cfg = load_config()
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
@@ -63,8 +78,9 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
             codex,
             claude,
         } => {
-            let service =
-                resolve_service(codex, claude).map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let service = resolve_service(codex, claude)
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             let mut cfg = load_config()
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
@@ -108,8 +124,9 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
             codex,
             claude,
         } => {
-            let service =
-                resolve_service(codex, claude).map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let service = resolve_service(codex, claude)
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             let mut cfg = load_config()
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;

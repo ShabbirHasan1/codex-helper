@@ -214,6 +214,7 @@ pub async fn handle_proxy(
         struct StreamUsageState {
             buffer: Vec<u8>,
             logged: bool,
+            warned_non_success: bool,
         }
 
         let max_collect = 1024 * 1024usize;
@@ -225,6 +226,7 @@ pub async fn handle_proxy(
         let base_url = selected.upstream.base_url.clone();
         let service_name = proxy.service_name.to_string();
         let start_time = start;
+        let status_code = status.as_u16();
 
         // 对于流式用户请求，也触发一次用量查询（如 packycode），用于驱动“用完自动切换”。
         if is_user_turn && is_codex_service {
@@ -252,15 +254,24 @@ pub async fn handle_proxy(
                     Ok(g) => g,
                     Err(_) => return,
                 };
-                if guard.logged {
-                    return;
-                }
                 let remaining = max_collect.saturating_sub(guard.buffer.len());
                 if remaining == 0 {
                     return;
                 }
                 let take = remaining.min(chunk.len());
                 guard.buffer.extend_from_slice(&chunk[..take]);
+                if !guard.warned_non_success && !(200..300).contains(&status_code) {
+                    let preview_len = guard.buffer.len().min(512);
+                    let body_preview = String::from_utf8_lossy(&guard.buffer[..preview_len]);
+                    warn!(
+                        "upstream returned non-2xx status {} for {} {} (config: {}): {}",
+                        status_code, method_s, path_s, config_name, body_preview
+                    );
+                    guard.warned_non_success = true;
+                }
+                if guard.logged {
+                    return;
+                }
                 if let Some(usage) = crate::usage::extract_usage_from_sse_bytes(&guard.buffer) {
                     guard.logged = true;
                     let dur = start_time.elapsed().as_millis() as u64;

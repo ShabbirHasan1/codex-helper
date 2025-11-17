@@ -67,9 +67,10 @@ fn default_providers() -> UsageProvidersFile {
 fn load_providers() -> UsageProvidersFile {
     let path = usage_providers_path();
     if let Ok(text) = std::fs::read_to_string(&path)
-        && let Ok(file) = serde_json::from_str::<UsageProvidersFile>(&text) {
-            return file;
-        }
+        && let Ok(file) = serde_json::from_str::<UsageProvidersFile>(&text)
+    {
+        return file;
+    }
 
     // 写入默认配置（当前仅包含 packycode），方便用户查看/修改
     let default = default_providers();
@@ -107,18 +108,20 @@ fn resolve_token(
     // 优先: token_env 环境变量
     if let Some(env_name) = &provider.token_env
         && let Ok(v) = std::env::var(env_name)
-            && !v.trim().is_empty() {
-                return Some(v);
-            }
+        && !v.trim().is_empty()
+    {
+        return Some(v);
+    }
 
     // 否则: 使用绑定 upstream 的 auth_token（当前 Codex 正在使用的 token）
     for uref in upstreams {
         if let Some(service) = cfg.codex.configs.get(&uref.config_name)
             && let Some(up) = service.upstreams.get(uref.index)
-                && let Some(token) = &up.auth.auth_token
-                    && !token.trim().is_empty() {
-                        return Some(token.clone());
-                    }
+            && let Some(token) = &up.auth.auth_token
+            && !token.trim().is_empty()
+        {
+            return Some(token.clone());
+        }
     }
     None
 }
@@ -234,9 +237,10 @@ pub async fn poll_for_codex_upstream(
                 Err(_) => continue,
             };
             if let Some(last) = map.get(&provider.id)
-                && now.duration_since(*last) < Duration::from_secs(interval_secs) {
-                    continue;
-                }
+                && now.duration_since(*last) < Duration::from_secs(interval_secs)
+            {
+                continue;
+            }
             map.insert(provider.id.clone(), now);
         }
 
@@ -247,9 +251,10 @@ pub async fn poll_for_codex_upstream(
             for upstream in &service.upstreams {
                 if domain_matches(&upstream.base_url, &provider.domains)
                     && let Ok(url) = reqwest::Url::parse(&upstream.base_url)
-                        && let Some(host) = url.host_str() {
-                            hosts.push(host.to_string());
-                        }
+                    && let Some(host) = url.host_str()
+                {
+                    hosts.push(host.to_string());
+                }
             }
         }
         hosts.sort();
