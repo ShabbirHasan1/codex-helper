@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::config::{ServiceConfig, UpstreamConfig};
+use tracing::info;
 
 pub const FAILURE_THRESHOLD: u32 = 3;
 pub const COOLDOWN_SECS: u64 = 30;
@@ -11,6 +12,7 @@ pub struct LbState {
     pub failure_counts: Vec<u32>,
     pub cooldown_until: Vec<Option<std::time::Instant>>,
     pub usage_exhausted: Vec<bool>,
+    pub last_good_index: Option<usize>,
 }
 
 impl LbState {
@@ -19,6 +21,8 @@ impl LbState {
             self.failure_counts = vec![0; len];
             self.cooldown_until = vec![None; len];
             self.usage_exhausted = vec![false; len];
+            // 如果 upstream 数量发生变化，原来的 last_good_index 很可能已经无效，直接清空。
+            self.last_good_index = None;
         }
     }
 }
@@ -63,6 +67,22 @@ impl LoadBalancer {
                 if let Some(slot) = entry.cooldown_until.get_mut(idx) {
                     *slot = None;
                 }
+            }
+        }
+
+        // 优先使用最近一次“成功”的 upstream，实现粘性路由：
+        // 一旦已经切换到可用线路，就尽量保持在该线路上，而不是每次都从头熔断。
+        if let Some(idx) = entry.last_good_index {
+            if idx < self.service.upstreams.len()
+                && entry.failure_counts[idx] < FAILURE_THRESHOLD
+                && !entry.usage_exhausted.get(idx).copied().unwrap_or(false)
+            {
+                let upstream = self.service.upstreams[idx].clone();
+                return Some(SelectedUpstream {
+                    config_name: self.service.name.clone(),
+                    index: idx,
+                    upstream,
+                });
             }
         }
 
@@ -139,13 +159,29 @@ impl LoadBalancer {
             if let Some(slot) = entry.cooldown_until.get_mut(index) {
                 *slot = None;
             }
+            // 成功请求会将该 upstream 记为“最近可用线路”，后续优先继续使用。
+            entry.last_good_index = Some(index);
         } else {
             entry.failure_counts[index] = entry.failure_counts[index].saturating_add(1);
             if entry.failure_counts[index] >= FAILURE_THRESHOLD
                 && let Some(slot) = entry.cooldown_until.get_mut(index)
             {
-                *slot =
-                    Some(std::time::Instant::now() + std::time::Duration::from_secs(COOLDOWN_SECS));
+                *slot = Some(
+                    std::time::Instant::now()
+                        + std::time::Duration::from_secs(COOLDOWN_SECS),
+                );
+                info!(
+                    "lb: upstream '{}' index {} reached failure threshold {} (count = {}), entering cooldown for {}s",
+                    self.service.name,
+                    index,
+                    FAILURE_THRESHOLD,
+                    entry.failure_counts[index],
+                    COOLDOWN_SECS
+                );
+                // 触发熔断时，如当前 last_good_index 指向该线路，则清空，允许后续选择其他线路。
+                if entry.last_good_index == Some(index) {
+                    entry.last_good_index = None;
+                }
             }
         }
     }

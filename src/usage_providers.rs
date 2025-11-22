@@ -15,6 +15,8 @@ use crate::lb::LbState;
 enum ProviderKind {
     /// 简单预算接口，返回 total/used，判断是否用尽
     BudgetHttpJson,
+    /// YesCode 账户用量，基于 /api/v1/auth/profile 返回的余额信息
+    YescodeProfile,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -53,14 +55,25 @@ fn usage_providers_path() -> std::path::PathBuf {
 
 fn default_providers() -> UsageProvidersFile {
     UsageProvidersFile {
-        providers: vec![UsageProviderConfig {
-            id: "packycode".to_string(),
-            kind: ProviderKind::BudgetHttpJson,
-            domains: vec!["packycode.com".to_string()],
-            endpoint: "https://www.packycode.com/api/backend/users/info".to_string(),
-            token_env: None,
-            poll_interval_secs: Some(60),
-        }],
+        providers: vec![
+            UsageProviderConfig {
+                id: "packycode".to_string(),
+                kind: ProviderKind::BudgetHttpJson,
+                domains: vec!["packycode.com".to_string()],
+                endpoint: "https://www.packycode.com/api/backend/users/info".to_string(),
+                token_env: None,
+                poll_interval_secs: Some(60),
+            },
+            UsageProviderConfig {
+                id: "yescode".to_string(),
+                kind: ProviderKind::YescodeProfile,
+                // yes.vg 匹配 co.yes.vg / cotest.yes.vg 等子域名
+                domains: vec!["yes.vg".to_string()],
+                endpoint: "https://co.yes.vg/api/v1/auth/profile".to_string(),
+                token_env: None,
+                poll_interval_secs: Some(60),
+            },
+        ],
     }
 }
 
@@ -154,6 +167,38 @@ async fn poll_budget_http_json(
 
     let exhausted = monthly_budget > 0.0 && monthly_spent >= monthly_budget;
     Ok((exhausted, monthly_budget, monthly_spent))
+}
+
+async fn poll_yescode_profile(
+    client: &Client,
+    endpoint: &str,
+    token: &str,
+) -> Result<(bool, f64, f64, f64)> {
+    let resp = client
+        .get(endpoint)
+        .header("X-API-Key", token)
+        .header("Accept", "application/json")
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!("yescode profile HTTP {}", resp.status());
+    }
+    let value: serde_json::Value = resp.json().await?;
+
+    let subscription_balance = value
+        .get("subscription_balance")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let paygo_balance = value
+        .get("pay_as_you_go_balance")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let total_balance = subscription_balance + paygo_balance;
+
+    // 简单策略：总余额 <= 0 视为额度用尽。
+    let exhausted = total_balance <= 0.0;
+    Ok((exhausted, total_balance, subscription_balance, paygo_balance))
 }
 
 fn update_usage_exhausted(
@@ -277,7 +322,7 @@ pub async fn poll_for_codex_upstream(
         let c = client.get_or_insert_with(Client::new);
 
         if let Some(token) = resolve_token(&provider, &upstreams, &cfg) {
-            let exhausted = match provider.kind {
+            match provider.kind {
                 ProviderKind::BudgetHttpJson => {
                     match poll_budget_http_json(c, &provider.endpoint, &token).await {
                         Ok((exhausted, monthly_budget, monthly_spent)) => {
@@ -286,18 +331,27 @@ pub async fn poll_for_codex_upstream(
                                 "usage provider '{}' exhausted = {} (monthly: {:.2}/{:.2} USD)",
                                 provider.id, exhausted, monthly_spent, monthly_budget
                             );
-                            exhausted
                         }
                         Err(err) => {
                             warn!("usage provider '{}' poll failed: {}", provider.id, err);
-                            false
                         }
                     }
                 }
-            };
-
-            // exhausted 状态已经在 update_usage_exhausted 中更新；这里不需要额外处理。
-            let _ = exhausted;
+                ProviderKind::YescodeProfile => {
+                    match poll_yescode_profile(c, &provider.endpoint, &token).await {
+                        Ok((exhausted, total_balance, sub_balance, paygo_balance)) => {
+                            update_usage_exhausted(&lb_states, &cfg, &upstreams, exhausted);
+                            info!(
+                                "usage provider '{}' exhausted = {} (yescode balance: total={:.2}, subscription={:.2}, paygo={:.2})",
+                                provider.id, exhausted, total_balance, sub_balance, paygo_balance
+                            );
+                        }
+                        Err(err) => {
+                            warn!("usage provider '{}' poll failed: {}", provider.id, err);
+                        }
+                    }
+                }
+            }
         } else {
             warn!(
                 "usage provider '{}' has no usable token (checked token_env and associated upstream auth_token); \

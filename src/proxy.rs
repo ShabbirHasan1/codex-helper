@@ -195,17 +195,20 @@ pub async fn handle_proxy(
 
     // 对用户对话轮次输出更有信息量的 info 日志。
     if is_user_turn {
-        let cwd = std::env::current_dir()
-            .ok()
-            .and_then(|p| p.to_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "<unknown>".to_string());
-        // 当前实现中，SelectedUpstream 只携带 config_name，别名可以在后续重构中通过扩展结构体补充。
+        let provider_id = selected
+            .upstream
+            .tags
+            .get("provider_id")
+            .map(|s| s.as_str())
+            .unwrap_or("-");
         info!(
-            "user turn {} {} using config '{}' (cwd: {})",
+            "user turn {} {} using config '{}' upstream[{}] provider_id='{}' base_url='{}'",
             method,
             uri.path(),
             selected.config_name,
-            cwd
+            selected.index,
+            provider_id,
+            selected.upstream.base_url
         );
     }
 
