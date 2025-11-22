@@ -345,5 +345,7 @@ pub async fn handle_proxy(
 }
 
 pub fn router(proxy: ProxyService) -> Router {
-    Router::new().route("/*path", any(move |req| handle_proxy(proxy.clone(), req)))
+    // axum 0.8 中，通配段需要使用 `/{*path}` 语法，这里保持与 0.7
+    // 时代的 `/*path` 行为等价：匹配任意路径并交给代理处理。
+    Router::new().route("/{*path}", any(move |req| handle_proxy(proxy.clone(), req)))
 }
