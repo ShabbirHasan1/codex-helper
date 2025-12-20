@@ -101,12 +101,12 @@ Example `~/.codex-helper/config.json`:
         "upstreams": [
           {
             "base_url": "https://codex-api.packycode.com/v1",
-            "auth": { "auth_token": "sk-packy-..." },
+            "auth": { "auth_token_env": "PACKYCODE_API_KEY" },
             "tags": { "provider_id": "packycode", "source": "codex-config" }
           },
           {
             "base_url": "https://co.yes.vg/v1",
-            "auth": { "auth_token": "cr-..." },
+            "auth": { "auth_token_env": "YESCODE_API_KEY" },
             "tags": { "provider_id": "yes", "source": "codex-config" }
           }
         ]
@@ -178,13 +178,13 @@ With this layout:
   # Codex
   codex-helper config add openai-main \
     --base-url https://api.openai.com/v1 \
-    --auth-token sk-openai-xxx \
+    --auth-token-env OPENAI_API_KEY \
     --alias "Main OpenAI quota"
 
   # Claude (experimental)
   codex-helper config add claude-main \
     --base-url https://api.anthropic.com/v1 \
-    --auth-token sk-claude-yyy \
+    --auth-token-env ANTHROPIC_AUTH_TOKEN \
     --alias "Claude main quota" \
     --claude
   ```
@@ -233,12 +233,12 @@ With this layout:
 # 1. Add configs for different providers
 codex-helper config add openai-main \
   --base-url https://api.openai.com/v1 \
-  --auth-token sk-openai-xxx \
+  --auth-token-env OPENAI_API_KEY \
   --alias "Main OpenAI quota"
 
 codex-helper config add packy-main \
   --base-url https://codex-api.packycode.com/v1 \
-  --auth-token sk-packy-yyy \
+  --auth-token-env PACKYCODE_API_KEY \
   --alias "Packy relay"
 
 codex-helper config list
@@ -282,6 +282,7 @@ Most users do not need to touch these. If you want deeper customization, these f
 - Filter rules: `~/.codex-helper/filter.json`
 - Usage providers: `~/.codex-helper/usage_providers.json`
 - Request logs: `~/.codex-helper/logs/requests.jsonl`
+- Detailed debug logs (optional): `~/.codex-helper/logs/requests_debug.jsonl` (only created when `http_debug` split is enabled)
 
 Codex official files:
 
@@ -302,8 +303,10 @@ Codex official files:
           {
             "base_url": "https://api.openai.com/v1",
             "auth": {
-              "auth_token": "sk-...",
-              "api_key": null
+              "auth_token": null,
+              "auth_token_env": "OPENAI_API_KEY",
+              "api_key": null,
+              "api_key_env": null
             },
             "tags": {
               "source": "codex-config",
@@ -344,7 +347,8 @@ Path: `~/.codex-helper/usage_providers.json`. If it does not exist, codex-helper
 
 For `budget_http_json`:
 
-- up to date usage is obtained by calling `endpoint` with a Bearer token (from `token_env` or the associated upstream’s `auth_token`);
+- up to date usage is obtained by calling `endpoint` with a Bearer token (from `token_env` or the associated upstream’s `auth_token` / `auth_token_env`);
+- if the upstream uses `auth_token_env`, the token is read from that environment variable at runtime;
 - the response is inspected for fields like `monthly_budget_usd` / `monthly_spent_usd` to decide if the quota is exhausted;
 - associated upstreams are then marked `usage_exhausted = true` in LB state; when possible, LB avoids these upstreams.
 
@@ -383,6 +387,33 @@ For `budget_http_json`:
   ```
 
 These fields form a **stable contract**: future versions will only add fields, not remove or rename existing ones, so you can safely build scripts and dashboards on top of them.
+
+### Optional HTTP debug logs (for 4xx/5xx)
+
+To help diagnose upstream `400` and other non-2xx responses, codex-helper can optionally attach an `http_debug` object to each log line (request headers, request body preview, upstream response headers/body preview, etc.).
+
+Enable it via env vars (off by default):
+
+- `CODEX_HELPER_HTTP_DEBUG=1`: only write `http_debug` for non-2xx upstream responses
+- `CODEX_HELPER_HTTP_DEBUG_ALL=1`: write `http_debug` for all requests (can grow logs quickly)
+- `CODEX_HELPER_HTTP_DEBUG_BODY_MAX=65536`: max bytes for request/response body preview (will truncate)
+- `CODEX_HELPER_HTTP_DEBUG_SPLIT=1`: write large `http_debug` blobs to `requests_debug.jsonl` and keep only `http_debug_ref` in `requests.jsonl` (recommended when `*_ALL=1`)
+
+You can also print a truncated `http_debug` JSON directly to the terminal on non-2xx responses (off by default):
+
+- `CODEX_HELPER_HTTP_WARN=1`: emit a `warn` log with `http_debug` JSON for non-2xx upstream responses
+- `CODEX_HELPER_HTTP_WARN_ALL=1`: emit for all requests (not recommended)
+- `CODEX_HELPER_HTTP_WARN_BODY_MAX=65536`: max bytes for body preview used by terminal output (will truncate)
+
+Sensitive headers are redacted automatically (e.g. `Authorization`/`Cookie`). If you need to scrub secrets inside request bodies, consider using `~/.codex-helper/filter.json`.
+
+### Log file size control (recommended)
+
+`requests.jsonl` is append-only by default. To avoid it growing without bound, codex-helper supports automatic log rotation (enabled by default):
+
+- `CODEX_HELPER_REQUEST_LOG_MAX_BYTES=52428800`: maximum bytes per log file before rotating (`requests.jsonl` → `requests.<timestamp_ms>.jsonl`; `requests_debug.jsonl` → `requests_debug.<timestamp_ms>.jsonl`) (default 50MB)
+- `CODEX_HELPER_REQUEST_LOG_MAX_FILES=10`: how many rotated files to keep (default 10)
+- `CODEX_HELPER_REQUEST_LOG_ONLY_ERRORS=1`: only log non-2xx requests (reduces disk usage; off by default)
 
 ---
 

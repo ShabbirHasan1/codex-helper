@@ -72,18 +72,17 @@ impl LoadBalancer {
 
         // 优先使用最近一次“成功”的 upstream，实现粘性路由：
         // 一旦已经切换到可用线路，就尽量保持在该线路上，而不是每次都从头熔断。
-        if let Some(idx) = entry.last_good_index {
-            if idx < self.service.upstreams.len()
-                && entry.failure_counts[idx] < FAILURE_THRESHOLD
-                && !entry.usage_exhausted.get(idx).copied().unwrap_or(false)
-            {
-                let upstream = self.service.upstreams[idx].clone();
-                return Some(SelectedUpstream {
-                    config_name: self.service.name.clone(),
-                    index: idx,
-                    upstream,
-                });
-            }
+        if let Some(idx) = entry.last_good_index
+            && idx < self.service.upstreams.len()
+            && entry.failure_counts[idx] < FAILURE_THRESHOLD
+            && !entry.usage_exhausted.get(idx).copied().unwrap_or(false)
+        {
+            let upstream = self.service.upstreams[idx].clone();
+            return Some(SelectedUpstream {
+                config_name: self.service.name.clone(),
+                index: idx,
+                upstream,
+            });
         }
 
         // 第一轮：按顺序选择第一个「未熔断 + 未标记用量用尽」的 upstream。
@@ -166,10 +165,8 @@ impl LoadBalancer {
             if entry.failure_counts[index] >= FAILURE_THRESHOLD
                 && let Some(slot) = entry.cooldown_until.get_mut(index)
             {
-                *slot = Some(
-                    std::time::Instant::now()
-                        + std::time::Duration::from_secs(COOLDOWN_SECS),
-                );
+                *slot =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(COOLDOWN_SECS));
                 info!(
                     "lb: upstream '{}' index {} reached failure threshold {} (count = {}), entering cooldown for {}s",
                     self.service.name,
@@ -202,7 +199,9 @@ mod tests {
                     base_url: u.to_string(),
                     auth: UpstreamAuth {
                         auth_token: Some("sk-test".to_string()),
+                        auth_token_env: None,
                         api_key: None,
+                        api_key_env: None,
                     },
                     tags: HashMap::new(),
                 })

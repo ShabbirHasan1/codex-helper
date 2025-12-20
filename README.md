@@ -101,12 +101,12 @@ codex-helper default --claude   # 将默认目标服务改为 Claude（实验）
         "upstreams": [
           {
             "base_url": "https://codex-api.packycode.com/v1",
-            "auth": { "auth_token": "sk-packy-..." },
+            "auth": { "auth_token_env": "PACKYCODE_API_KEY" },
             "tags": { "provider_id": "packycode", "source": "codex-config" }
           },
           {
             "base_url": "https://co.yes.vg/v1",
-            "auth": { "auth_token": "cr-..." },
+            "auth": { "auth_token_env": "YESCODE_API_KEY" },
             "tags": { "provider_id": "yes", "source": "codex-config" }
           }
         ]
@@ -179,13 +179,13 @@ codex-helper default --claude   # 将默认目标服务改为 Claude（实验）
   # Codex
   codex-helper config add openai-main \
     --base-url https://api.openai.com/v1 \
-    --auth-token sk-openai-xxx \
+    --auth-token-env OPENAI_API_KEY \
     --alias "OpenAI 主额度"
 
   # Claude（实验）
   codex-helper config add claude-main \
     --base-url https://api.anthropic.com/v1 \
-    --auth-token sk-claude-yyy \
+    --auth-token-env ANTHROPIC_AUTH_TOKEN \
     --alias "Claude 主额度" \
     --claude
   ```
@@ -234,12 +234,12 @@ codex-helper default --claude   # 将默认目标服务改为 Claude（实验）
 # 1. 为不同供应商添加配置
 codex-helper config add openai-main \
   --base-url https://api.openai.com/v1 \
-  --auth-token sk-openai-xxx \
+  --auth-token-env OPENAI_API_KEY \
   --alias "OpenAI 主额度"
 
 codex-helper config add packy-main \
   --base-url https://codex-api.packycode.com/v1 \
-  --auth-token sk-packy-yyy \
+  --auth-token-env PACKYCODE_API_KEY \
   --alias "Packy 中转"
 
 codex-helper config list
@@ -283,6 +283,7 @@ codex-helper session last --path ~/code/my-app
 - 请求过滤：`~/.codex-helper/filter.json`
 - 用量提供商：`~/.codex-helper/usage_providers.json`
 - 请求日志：`~/.codex-helper/logs/requests.jsonl`
+- 详细调试日志（可选）：`~/.codex-helper/logs/requests_debug.jsonl`（仅在启用 `http_debug` 拆分时生成）
 
 Codex 官方文件：
 
@@ -303,8 +304,10 @@ Codex 官方文件：
           {
             "base_url": "https://api.openai.com/v1",
             "auth": {
-              "auth_token": "sk-...",
-              "api_key": null
+              "auth_token": null,
+              "auth_token_env": "OPENAI_API_KEY",
+              "api_key": null,
+              "api_key_env": null
             },
             "tags": {
               "source": "codex-config",
@@ -346,6 +349,7 @@ Codex 官方文件：
 行为简述：
 
 - upstream 的 `base_url` host 匹配 `domains` 中任一项，即视为该 provider 的管理对象；
+- 调用 `endpoint` 的认证 token 优先来自 `token_env`，否则尝试使用绑定 upstream 的 `auth.auth_token` / `auth.auth_token_env`（运行时从环境变量解析）；
 - 请求结束后，codex-helper 按需调用 `endpoint` 查询额度，解析 `monthly_budget_usd` / `monthly_spent_usd`；
 - 当额度用尽时，对应 upstream 在 LB 中被标记为 `usage_exhausted = true`，优先避开该线路。
 
@@ -366,6 +370,31 @@ Codex 官方文件：
   - `service`（codex/claude）、`method`、`path`、`status_code`、`duration_ms`；
   - `config_name`、`upstream_base_url`；
   - `usage`（input/output/total_tokens 等）。
+  - （可选）`http_debug`：用于排查 4xx/5xx 时记录更完整的请求/响应信息（请求头、请求体预览、上游响应头/响应体预览等）。
+  - （可选）`http_debug_ref`：当启用拆分写入时，主日志只保存引用，详细内容写入 `requests_debug.jsonl`。
+
+  你可以通过环境变量启用该调试日志（默认关闭）：
+
+  - `CODEX_HELPER_HTTP_DEBUG=1`：仅当上游返回非 2xx 时写入 `http_debug`；
+  - `CODEX_HELPER_HTTP_DEBUG_ALL=1`：对所有请求都写入 `http_debug`（更容易产生日志膨胀）；
+  - `CODEX_HELPER_HTTP_DEBUG_BODY_MAX=65536`：请求/响应 body 预览的最大字节数（会截断）。
+  - `CODEX_HELPER_HTTP_DEBUG_SPLIT=1`：将 `http_debug` 大对象拆分写入 `requests_debug.jsonl`，主 `requests.jsonl` 仅保留 `http_debug_ref`（推荐在 `*_ALL=1` 时开启）。
+
+  另外，你也可以让代理在终端直接输出更完整的非 2xx 调试信息（同样默认关闭）：
+
+  - `CODEX_HELPER_HTTP_WARN=1`：当上游返回非 2xx 时，以 `warn` 级别输出一段裁剪后的 `http_debug` JSON；
+  - `CODEX_HELPER_HTTP_WARN_ALL=1`：对所有请求都输出（不建议，容易泄露/刷屏）；
+  - `CODEX_HELPER_HTTP_WARN_BODY_MAX=65536`：终端输出里 body 预览的最大字节数（会截断）。
+
+  注意：敏感请求头会自动脱敏（例如 `Authorization`/`Cookie` 等）；如需进一步控制请求体中的敏感信息，建议配合 `~/.codex-helper/filter.json` 使用。
+
+### 日志文件大小控制（推荐）
+
+`requests.jsonl` 默认会持续追加，为避免长期运行导致文件过大，codex-helper 支持自动轮转（默认开启）：
+
+- `CODEX_HELPER_REQUEST_LOG_MAX_BYTES=52428800`：单个日志文件最大字节数，超过会自动轮转（`requests.jsonl` → `requests.<timestamp_ms>.jsonl`；`requests_debug.jsonl` → `requests_debug.<timestamp_ms>.jsonl`）（默认 50MB）；
+- `CODEX_HELPER_REQUEST_LOG_MAX_FILES=10`：最多保留多少个历史轮转文件（默认 10）；
+- `CODEX_HELPER_REQUEST_LOG_ONLY_ERRORS=1`：只记录非 2xx 请求（可显著减少日志量，默认关闭）。
 
 这些字段是稳定契约，后续版本只会在此基础上追加字段，不会删除或改名，方便脚本长期依赖。
 

@@ -197,6 +197,15 @@ enum ConfigCommand {
         base_url: String,
         #[arg(long)]
         auth_token: Option<String>,
+        /// Read bearer token from an environment variable instead of storing it on disk
+        #[arg(long, conflicts_with = "auth_token")]
+        auth_token_env: Option<String>,
+        /// Use X-API-Key header value (some providers)
+        #[arg(long, conflicts_with = "api_key_env")]
+        api_key: Option<String>,
+        /// Read X-API-Key header value from an environment variable
+        #[arg(long, conflicts_with = "api_key")]
+        api_key_env: Option<String>,
         /// Optional alias for this config
         #[arg(long)]
         alias: Option<String>,
@@ -612,19 +621,18 @@ fn print_codex_switch_status() {
         .unwrap_or("<未设置>");
     println!("  当前 model_provider: {}", provider.bold());
 
-    if provider == "codex_proxy" {
-        if let Some(providers) = table.get("model_providers").and_then(|v| v.as_table()) {
-            if let Some(proxy) = providers.get("codex_proxy").and_then(|v| v.as_table()) {
-                let base_url = proxy.get("base_url").and_then(|v| v.as_str()).unwrap_or("");
-                let name = proxy.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                println!("  codex_proxy.name: {}", name);
-                println!("  codex_proxy.base_url: {}", base_url);
+    if provider == "codex_proxy"
+        && let Some(providers) = table.get("model_providers").and_then(|v| v.as_table())
+        && let Some(proxy) = providers.get("codex_proxy").and_then(|v| v.as_table())
+    {
+        let base_url = proxy.get("base_url").and_then(|v| v.as_str()).unwrap_or("");
+        let name = proxy.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        println!("  codex_proxy.name: {}", name);
+        println!("  codex_proxy.base_url: {}", base_url);
 
-                let is_local = base_url.contains("127.0.0.1") || base_url.contains("localhost");
-                if is_local {
-                    println!("  -> 当前 Codex 已指向本地 codex-helper 代理。");
-                }
-            }
+        let is_local = base_url.contains("127.0.0.1") || base_url.contains("localhost");
+        if is_local {
+            println!("  -> 当前 Codex 已指向本地 codex-helper 代理。");
         }
     }
 

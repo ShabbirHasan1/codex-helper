@@ -130,10 +130,13 @@ fn resolve_token(
     for uref in upstreams {
         if let Some(service) = cfg.codex.configs.get(&uref.config_name)
             && let Some(up) = service.upstreams.get(uref.index)
-            && let Some(token) = &up.auth.auth_token
-            && !token.trim().is_empty()
         {
-            return Some(token.clone());
+            if let Some(token) = up.auth.resolve_auth_token() {
+                return Some(token);
+            }
+            if let Some(token) = up.auth.resolve_api_key() {
+                return Some(token);
+            }
         }
     }
     None
@@ -198,7 +201,12 @@ async fn poll_yescode_profile(
 
     // 简单策略：总余额 <= 0 视为额度用尽。
     let exhausted = total_balance <= 0.0;
-    Ok((exhausted, total_balance, subscription_balance, paygo_balance))
+    Ok((
+        exhausted,
+        total_balance,
+        subscription_balance,
+        paygo_balance,
+    ))
 }
 
 fn update_usage_exhausted(

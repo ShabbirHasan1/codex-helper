@@ -19,7 +19,7 @@ pub async fn handle_usage_cmd(cmd: UsageCommand) -> CliResult<()> {
             let file = File::open(&log_path)
                 .map_err(|e| CliError::Usage(format!("无法打开请求日志 {:?}: {}", log_path, e)))?;
             let reader = BufReader::new(file);
-            let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+            let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
             let total = lines.len();
             let start = total.saturating_sub(limit);
             for line in &lines[start..] {
@@ -54,7 +54,7 @@ pub async fn handle_usage_cmd(cmd: UsageCommand) -> CliResult<()> {
             let reader = BufReader::new(file);
             let mut aggregate: HashMap<String, (u64, i64, i64, i64)> = HashMap::new();
 
-            for line in reader.lines().filter_map(|l| l.ok()) {
+            for line in reader.lines().map_while(Result::ok) {
                 if let Ok(v) = serde_json::from_str::<JsonValue>(&line) {
                     let config_name = v
                         .get("config_name")

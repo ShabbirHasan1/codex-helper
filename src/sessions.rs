@@ -322,18 +322,17 @@ fn parse_timestamp_and_uuid(name: &str) -> Option<(String, String)> {
     // Expected: rollout-YYYY-MM-DDThh-mm-ss-<uuid>.jsonl
     let core = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
 
-    // Scan from the right for a '-' such that the suffix is a non-empty UUID string.
-    let (sep_idx, uuid_str) = core.match_indices('-').rev().find_map(|(i, _)| {
-        let candidate = &core[i + 1..];
-        if !candidate.is_empty() {
-            Some((i, candidate.to_string()))
-        } else {
-            None
-        }
-    })?;
-
-    let ts_str = &core[..sep_idx];
-    Some((ts_str.to_string(), uuid_str))
+    // Timestamp format is stable and has a fixed width: "YYYY-MM-DDThh-mm-ss" (19 chars).
+    const TS_LEN: usize = 19;
+    if core.len() <= TS_LEN + 1 {
+        return None;
+    }
+    let (ts, rest) = core.split_at(TS_LEN);
+    let uuid = rest.strip_prefix('-')?;
+    if uuid.is_empty() {
+        return None;
+    }
+    Some((ts.to_string(), uuid.to_string()))
 }
 
 fn sort_by_updated_desc(vec: &mut [SessionSummary]) {
@@ -390,5 +389,13 @@ mod tests {
             !path_matches_current_dir(&session_cwd, &project),
             "unrelated paths should not match"
         );
+    }
+
+    #[test]
+    fn parse_rollout_filename_splits_uuid_correctly() {
+        let name = "rollout-2025-12-20T16-01-02-550e8400-e29b-41d4-a716-446655440000.jsonl";
+        let (ts, uuid) = parse_timestamp_and_uuid(name).expect("should parse");
+        assert_eq!(ts, "2025-12-20T16-01-02");
+        assert_eq!(uuid, "550e8400-e29b-41d4-a716-446655440000");
     }
 }

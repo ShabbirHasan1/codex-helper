@@ -123,6 +123,40 @@ impl RequestFilter {
         inner.last_mtime = mtime;
     }
 
+    fn find_subslice(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+        if needle.is_empty() {
+            return None;
+        }
+        if from >= haystack.len() {
+            return None;
+        }
+        let first = needle[0];
+        let mut i = from;
+        while i + needle.len() <= haystack.len() {
+            if haystack[i] == first && &haystack[i..i + needle.len()] == needle {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn replace_all_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+        if needle.is_empty() {
+            return haystack.to_vec();
+        }
+
+        let mut out = Vec::with_capacity(haystack.len());
+        let mut cursor = 0usize;
+        while let Some(pos) = Self::find_subslice(haystack, needle, cursor) {
+            out.extend_from_slice(&haystack[cursor..pos]);
+            out.extend_from_slice(replacement);
+            cursor = pos + needle.len();
+        }
+        out.extend_from_slice(&haystack[cursor..]);
+        out
+    }
+
     pub fn apply(&self, data: &[u8]) -> Vec<u8> {
         if data.is_empty() {
             return Vec::new();
@@ -147,31 +181,65 @@ impl RequestFilter {
                             .replace_all(&buf, rule.target_bytes.as_slice())
                             .into_owned();
                     } else {
-                        buf = buf
-                            .split(|b| b == &rule.source_bytes[0])
-                            .flat_map(|chunk| chunk.to_vec())
-                            .collect();
+                        buf = Self::replace_all_bytes(
+                            &buf,
+                            rule.source_bytes.as_slice(),
+                            rule.target_bytes.as_slice(),
+                        );
                     }
                 }
                 FilterOp::Remove => {
                     if let Some(re) = &rule.regex {
                         buf = re.replace_all(&buf, &[][..]).into_owned();
-                    } else if !rule.source_bytes.is_empty() {
-                        buf = buf
-                            .windows(rule.source_bytes.len())
-                            .enumerate()
-                            .filter_map(|(i, window)| {
-                                if window == rule.source_bytes.as_slice() {
-                                    None
-                                } else {
-                                    Some(buf[i])
-                                }
-                            })
-                            .collect();
+                    } else {
+                        buf = Self::replace_all_bytes(&buf, rule.source_bytes.as_slice(), &[][..]);
                     }
                 }
             }
         }
         buf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn literal_replace_fallback_works_when_regex_invalid() {
+        let filter = RequestFilter::new();
+        {
+            let mut inner = filter.inner.lock().unwrap();
+            let invalid_pattern = "[".to_string();
+            inner.rules = vec![CompiledRule {
+                op: FilterOp::Replace,
+                source_bytes: b"secret".to_vec(),
+                target_bytes: b"[REDACTED]".to_vec(),
+                regex: Regex::new(&invalid_pattern).ok(), // invalid regex => None => triggers fallback
+            }];
+            inner.last_check = Some(SystemTime::now()); // avoid touching filesystem in tests
+        }
+
+        let out = filter.apply(b"hello secret world secret!");
+        assert_eq!(out, b"hello [REDACTED] world [REDACTED]!");
+    }
+
+    #[test]
+    fn literal_remove_fallback_works_when_regex_invalid() {
+        let filter = RequestFilter::new();
+        {
+            let mut inner = filter.inner.lock().unwrap();
+            let invalid_pattern = "[".to_string();
+            inner.rules = vec![CompiledRule {
+                op: FilterOp::Remove,
+                source_bytes: b"XX".to_vec(),
+                target_bytes: Vec::new(),
+                regex: Regex::new(&invalid_pattern).ok(), // invalid regex => None => triggers fallback
+            }];
+            inner.last_check = Some(SystemTime::now()); // avoid touching filesystem in tests
+        }
+
+        let out = filter.apply(b"aaXXbbXXXXcc");
+        assert_eq!(out, b"aabbcc");
     }
 }

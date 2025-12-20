@@ -124,7 +124,7 @@ pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
                 if let Some(cwd) = sess.cwd.as_deref() {
                     md.push_str(&format!("- cwd: `{}`\n", cwd));
                 }
-                md.push_str("\n");
+                md.push('\n');
                 if let Some(msg) = sess.first_user_message.as_deref() {
                     md.push_str("## First user message\n\n");
                     md.push_str(msg);
@@ -135,15 +135,14 @@ pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
 
             if let Some(path) = output {
                 let out_path = std::path::PathBuf::from(path);
-                if let Some(parent) = out_path.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        if let Err(e) = std::fs::create_dir_all(parent) {
-                            return Err(crate::CliError::Other(format!(
-                                "failed to create parent dir {:?}: {}",
-                                parent, e
-                            )));
-                        }
-                    }
+                if let Some(parent) = out_path.parent()
+                    && !parent.as_os_str().is_empty()
+                    && let Err(e) = std::fs::create_dir_all(parent)
+                {
+                    return Err(crate::CliError::Other(format!(
+                        "failed to create parent dir {:?}: {}",
+                        parent, e
+                    )));
                 }
                 if let Err(e) = std::fs::write(&out_path, content) {
                     return Err(crate::CliError::Other(format!(

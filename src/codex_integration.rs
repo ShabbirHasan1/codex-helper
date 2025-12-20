@@ -162,7 +162,7 @@ pub fn guard_codex_config_before_switch_on_interactive() -> Result<()> {
 
     // 仅当当前 provider 看起来是“本地 codex-helper 代理”时才触发守护逻辑。
     let is_local = base_url.contains("127.0.0.1") || base_url.contains("localhost");
-    let is_helper_name = name == "codex-helper" || name == "codex-helper";
+    let is_helper_name = name == "codex-helper";
     if !is_local && !is_helper_name {
         return Ok(());
     }

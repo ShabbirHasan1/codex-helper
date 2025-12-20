@@ -5,6 +5,7 @@ use crate::config::{
 use owo_colors::OwoColorize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
+use std::env;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
@@ -87,7 +88,10 @@ pub async fn handle_status_cmd(json: bool) -> CliResult<()> {
         );
     } else {
         let active = cfg.claude.active.as_deref();
-        println!("{}", "Claude configs in ~/.codex-helper/config.json:".bold());
+        println!(
+            "{}",
+            "Claude configs in ~/.codex-helper/config.json:".bold()
+        );
         for (name, svc) in &cfg.claude.configs {
             let marker = if Some(name.as_str()) == active {
                 "*"
@@ -152,6 +156,83 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
                     status: "ok",
                     message: msg,
                 });
+            }
+
+            // 1.1) 认证与安全性检查：缺失环境变量 / 明文密钥落盘
+            fn env_is_set(key: &str) -> bool {
+                env::var(key)
+                    .ok()
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false)
+            }
+
+            for (svc_label, mgr) in [("Codex", &cfg.codex), ("Claude", &cfg.claude)] {
+                let Some(active_name) = mgr.active.as_deref() else {
+                    continue;
+                };
+                let Some(active_cfg) = mgr.active_config() else {
+                    continue;
+                };
+                for (idx, up) in active_cfg.upstreams.iter().enumerate() {
+                    if let Some(env_name) = up.auth.auth_token_env.as_deref()
+                        && !env_is_set(env_name)
+                    {
+                        let msg = format!(
+                            "{} active config '{}' upstream[{}] 缺少环境变量 {}（Bearer token）；请在运行 codex-helper 前设置该变量",
+                            svc_label, active_name, idx, env_name
+                        );
+                        if !json {
+                            println!("{} {}", "[WARN]".yellow(), msg);
+                        }
+                        checks.push(DoctorCheck {
+                            id: "proxy_config.auth.env_missing",
+                            status: "warn",
+                            message: msg,
+                        });
+                    }
+                    if let Some(env_name) = up.auth.api_key_env.as_deref()
+                        && !env_is_set(env_name)
+                    {
+                        let msg = format!(
+                            "{} active config '{}' upstream[{}] 缺少环境变量 {}（X-API-Key）；请在运行 codex-helper 前设置该变量",
+                            svc_label, active_name, idx, env_name
+                        );
+                        if !json {
+                            println!("{} {}", "[WARN]".yellow(), msg);
+                        }
+                        checks.push(DoctorCheck {
+                            id: "proxy_config.auth.env_missing",
+                            status: "warn",
+                            message: msg,
+                        });
+                    }
+                    if up
+                        .auth
+                        .auth_token
+                        .as_deref()
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false)
+                        || up
+                            .auth
+                            .api_key
+                            .as_deref()
+                            .map(|s| !s.trim().is_empty())
+                            .unwrap_or(false)
+                    {
+                        let msg = format!(
+                            "{} active config '{}' upstream[{}] 在 ~/.codex-helper/config.json 中检测到明文密钥字段（建议改用 auth_token_env/api_key_env 以避免落盘泄露）",
+                            svc_label, active_name, idx
+                        );
+                        if !json {
+                            println!("{} {}", "[WARN]".yellow(), msg);
+                        }
+                        checks.push(DoctorCheck {
+                            id: "proxy_config.auth.plaintext",
+                            status: "warn",
+                            message: msg,
+                        });
+                    }
+                }
             }
         }
         Err(err) => {

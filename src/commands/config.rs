@@ -74,6 +74,9 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
             name,
             base_url,
             auth_token,
+            auth_token_env,
+            api_key,
+            api_key_env,
             alias,
             codex,
             claude,
@@ -89,7 +92,9 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                 base_url,
                 auth: UpstreamAuth {
                     auth_token,
-                    api_key: None,
+                    auth_token_env,
+                    api_key,
+                    api_key_env,
                 },
                 tags: Default::default(),
             };
