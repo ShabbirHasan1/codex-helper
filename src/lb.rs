@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::config::{ServiceConfig, UpstreamConfig};
@@ -47,7 +48,12 @@ impl LoadBalancer {
         Self { service, states }
     }
 
+    #[allow(dead_code)]
     pub fn select_upstream(&self) -> Option<SelectedUpstream> {
+        self.select_upstream_avoiding(&HashSet::new())
+    }
+
+    pub fn select_upstream_avoiding(&self, avoid: &HashSet<usize>) -> Option<SelectedUpstream> {
         if self.service.upstreams.is_empty() {
             return None;
         }
@@ -76,6 +82,7 @@ impl LoadBalancer {
             && idx < self.service.upstreams.len()
             && entry.failure_counts[idx] < FAILURE_THRESHOLD
             && !entry.usage_exhausted.get(idx).copied().unwrap_or(false)
+            && !avoid.contains(&idx)
         {
             let upstream = self.service.upstreams[idx].clone();
             return Some(SelectedUpstream {
@@ -92,6 +99,9 @@ impl LoadBalancer {
             .iter()
             .enumerate()
             .find_map(|(idx, _)| {
+                if avoid.contains(&idx) {
+                    return None;
+                }
                 if entry.failure_counts[idx] >= FAILURE_THRESHOLD {
                     return None;
                 }
@@ -116,6 +126,9 @@ impl LoadBalancer {
             .iter()
             .enumerate()
             .find_map(|(idx, _)| {
+                if avoid.contains(&idx) {
+                    return None;
+                }
                 if entry.failure_counts[idx] >= FAILURE_THRESHOLD {
                     None
                 } else {
@@ -132,13 +145,42 @@ impl LoadBalancer {
         }
 
         // 兜底：所有 upstream 都已达到失败阈值时，仍然返回第一个，以保证永远有兜底。
-        let idx = 0;
+        // 如果 avoid 把所有都排除了，则兜底返回第一个“非 avoid”的 upstream；仍然没有则返回 0。
+        let idx = (0..self.service.upstreams.len())
+            .find(|i| !avoid.contains(i))
+            .unwrap_or(0);
         let upstream = self.service.upstreams[idx].clone();
         Some(SelectedUpstream {
             config_name: self.service.name.clone(),
             index: idx,
             upstream,
         })
+    }
+
+    pub fn penalize(&self, index: usize, cooldown_secs: u64, reason: &str) {
+        let mut map = match self.states.lock() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let entry = map
+            .entry(self.service.name.clone())
+            .or_insert_with(LbState::default);
+        entry.ensure_len(self.service.upstreams.len());
+        if index >= entry.failure_counts.len() {
+            return;
+        }
+
+        entry.failure_counts[index] = FAILURE_THRESHOLD;
+        if let Some(slot) = entry.cooldown_until.get_mut(index) {
+            *slot = Some(std::time::Instant::now() + std::time::Duration::from_secs(cooldown_secs));
+        }
+        if entry.last_good_index == Some(index) {
+            entry.last_good_index = None;
+        }
+        info!(
+            "lb: upstream '{}' index {} penalized for {}s (reason: {})",
+            self.service.name, index, cooldown_secs, reason
+        );
     }
 
     pub fn record_result(&self, index: usize, success: bool) {

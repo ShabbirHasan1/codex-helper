@@ -56,6 +56,7 @@ This will:
 - Start a Codex proxy on `127.0.0.1:3211`;
 - Guard and, if needed, rewrite `~/.codex/config.toml` to point Codex at the local proxy (backing up the original config on first run);
 - If `~/.codex-helper/config.json` is still empty, bootstrap a default upstream from `~/.codex/config.toml` + `auth.json`;
+- If running in an interactive terminal, show a built-in TUI dashboard (disable with `--no-tui`; press `q` to quit);
 - On Ctrl+C, attempt to restore the original Codex config from the backup.
 
 After that, you keep using your usual `codex ...` commands; codex-helper just sits in the middle.
@@ -136,6 +137,7 @@ With this layout:
   - `codex-helper` / `ch`
 - Explicit Codex / Claude proxy:
   - `codex-helper serve` (Codex, default port 3211)
+  - `codex-helper serve --no-tui` (disable the built-in TUI dashboard)
   - `codex-helper serve --codex`
   - `codex-helper serve --claude` (Claude, default port 3210)
 
@@ -388,6 +390,8 @@ For `budget_http_json`:
 
 These fields form a **stable contract**: future versions will only add fields, not remove or rename existing ones, so you can safely build scripts and dashboards on top of them.
 
+When retries happen, logs may also include a `retry` object (e.g. `retry.attempts` and `retry.upstream_chain`) to help you understand which upstreams were tried before the final result.
+
 ### Optional HTTP debug logs (for 4xx/5xx)
 
 To help diagnose upstream `400` and other non-2xx responses, codex-helper can optionally attach an `http_debug` object to each log line (request headers, request body preview, upstream response headers/body preview, etc.).
@@ -406,6 +410,37 @@ You can also print a truncated `http_debug` JSON directly to the terminal on non
 - `CODEX_HELPER_HTTP_WARN_BODY_MAX=65536`: max bytes for body preview used by terminal output (will truncate)
 
 Sensitive headers are redacted automatically (e.g. `Authorization`/`Cookie`). If you need to scrub secrets inside request bodies, consider using `~/.codex-helper/filter.json`.
+
+### Upstream retries (default 2 attempts)
+
+Some upstream failures are transient (network hiccups, 502/503/504/524, or Cloudflare/WAF-like HTML challenge pages). codex-helper can perform a small number of retries **before any response bytes are streamed to the client**, and will try to switch to a different upstream when possible.
+
+- Global defaults live under the `retry` block in `~/.codex-helper/config.json`. Environment variables with the same names can override them at runtime (useful for temporary debugging).
+- `CODEX_HELPER_RETRY_MAX_ATTEMPTS=2`: max attempts (default from `retry.max_attempts`; max 8; set to 1 to disable)
+- `CODEX_HELPER_RETRY_ON_STATUS=502,503,504,524`: retry on these status codes (supports ranges like `500-599`)
+- `CODEX_HELPER_RETRY_ON_CLASS=upstream_transport_error,cloudflare_timeout,cloudflare_challenge`: retry on these error classes
+- `CODEX_HELPER_RETRY_BACKOFF_MS=200` / `CODEX_HELPER_RETRY_BACKOFF_MAX_MS=2000` / `CODEX_HELPER_RETRY_JITTER_MS=100`: retry backoff (ms)
+- `CODEX_HELPER_RETRY_CLOUDFLARE_CHALLENGE_COOLDOWN_SECS=300` / `CODEX_HELPER_RETRY_CLOUDFLARE_TIMEOUT_COOLDOWN_SECS=60` / `CODEX_HELPER_RETRY_TRANSPORT_COOLDOWN_SECS=30`: upstream cooldown penalties (seconds)
+
+Example config (`~/.codex-helper/config.json`):
+
+```jsonc
+{
+  "retry": {
+    "max_attempts": 2,
+    "backoff_ms": 200,
+    "backoff_max_ms": 2000,
+    "jitter_ms": 100,
+    "on_status": "502,503,504,524",
+    "on_class": ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challenge"],
+    "cloudflare_challenge_cooldown_secs": 300,
+    "cloudflare_timeout_cooldown_secs": 60,
+    "transport_cooldown_secs": 30
+  }
+}
+```
+
+Note: retries may replay **non-idempotent POST requests** (potential double-billing or duplicate writes). Only enable retries if you accept this risk, and keep the attempt count low.
 
 ### Log file size control (recommended)
 

@@ -53,10 +53,11 @@ ch
 它会自动帮你：
 
 - 启动 Codex 本地代理，监听 `127.0.0.1:3211`；
+- 如果在交互终端运行，会默认显示一个内置 TUI 面板（可用 `--no-tui` 关闭；按 `q` 退出）；
 - 在修改前检查 `~/.codex/config.toml`，如已指向本地代理且存在备份，会询问是否先恢复原始配置；
 - 必要时修改 `model_provider` 与 `model_providers.codex_proxy`，让 Codex 走本地代理，并只在首次写入备份；
 - 如果 `~/.codex-helper/config.json` 还没初始化，会尝试根据 `~/.codex/config.toml` + `auth.json` 推导一个默认上游；
-- 用 Ctrl+C 优雅退出时，尝试从备份恢复原始 Codex 配置。
+- 用 Ctrl+C 或在 TUI 中按 `q` 退出时，尝试从备份恢复原始 Codex 配置。
 
 从此之后，你继续用原来的 `codex` 命令即可，所有请求会自动经过 codex-helper。
 
@@ -139,6 +140,7 @@ codex-helper default --claude   # 将默认目标服务改为 Claude（实验）
   - `codex-helper serve`（Codex，默认端口 3211）
   - `codex-helper serve --codex`
   - `codex-helper serve --claude`（Claude，默认端口 3210）
+  - `codex-helper serve --no-tui`（关闭内置 TUI 面板）
 
 ### 开关 Codex / Claude
 
@@ -370,6 +372,7 @@ Codex 官方文件：
   - `service`（codex/claude）、`method`、`path`、`status_code`、`duration_ms`；
   - `config_name`、`upstream_base_url`；
   - `usage`（input/output/total_tokens 等）。
+  - （可选）`retry`：发生重试/切换上游时记录重试次数与尝试链路（便于回溯问题）。
   - （可选）`http_debug`：用于排查 4xx/5xx 时记录更完整的请求/响应信息（请求头、请求体预览、上游响应头/响应体预览等）。
   - （可选）`http_debug_ref`：当启用拆分写入时，主日志只保存引用，详细内容写入 `requests_debug.jsonl`。
 
@@ -387,6 +390,37 @@ Codex 官方文件：
   - `CODEX_HELPER_HTTP_WARN_BODY_MAX=65536`：终端输出里 body 预览的最大字节数（会截断）。
 
   注意：敏感请求头会自动脱敏（例如 `Authorization`/`Cookie` 等）；如需进一步控制请求体中的敏感信息，建议配合 `~/.codex-helper/filter.json` 使用。
+
+### 上游重试（默认 2 次尝试）
+
+有些上游错误（例如网络抖动、502/503/504/524、或看起来像 Cloudflare/WAF 的拦截页）可能是瞬态的；codex-helper 支持在**未开始向客户端输出响应**前进行有限次数的重试，并尽量切换到其它 upstream。
+
+- `~/.codex-helper/config.json` 的 `retry` 段可以设置全局默认值；同名环境变量可在运行时覆盖（用于临时调试）。
+- `CODEX_HELPER_RETRY_MAX_ATTEMPTS=2`：最大尝试次数（默认来自配置的 `retry.max_attempts`，最大 8；如需关闭重试请设为 1）
+- `CODEX_HELPER_RETRY_ON_STATUS=502,503,504,524`：遇到这些状态码时允许重试（支持 `a-b` 区间，例如 `500-599`）
+- `CODEX_HELPER_RETRY_ON_CLASS=upstream_transport_error,cloudflare_timeout,cloudflare_challenge`：按错误分类允许重试
+- `CODEX_HELPER_RETRY_BACKOFF_MS=200` / `CODEX_HELPER_RETRY_BACKOFF_MAX_MS=2000` / `CODEX_HELPER_RETRY_JITTER_MS=100`：重试退避参数（毫秒）
+- `CODEX_HELPER_RETRY_CLOUDFLARE_CHALLENGE_COOLDOWN_SECS=300` / `CODEX_HELPER_RETRY_CLOUDFLARE_TIMEOUT_COOLDOWN_SECS=60` / `CODEX_HELPER_RETRY_TRANSPORT_COOLDOWN_SECS=30`：对触发重试的 upstream 施加冷却（秒）
+
+配置示例（`~/.codex-helper/config.json`）：
+
+```jsonc
+{
+  "retry": {
+    "max_attempts": 2,
+    "backoff_ms": 200,
+    "backoff_max_ms": 2000,
+    "jitter_ms": 100,
+    "on_status": "502,503,504,524",
+    "on_class": ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challenge"],
+    "cloudflare_challenge_cooldown_secs": 300,
+    "cloudflare_timeout_cooldown_secs": 60,
+    "transport_cooldown_secs": 30
+  }
+}
+```
+
+注意：重试可能导致 **POST 请求重放**（例如重复计费/重复写入）。建议仅在你明确接受这一风险、且错误大多是瞬态的场景下开启，并将尝试次数控制在较小范围内。
 
 ### 日志文件大小控制（推荐）
 

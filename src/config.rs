@@ -101,6 +101,39 @@ impl ServiceConfigManager {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryConfig {
+    pub max_attempts: u32,
+    pub backoff_ms: u64,
+    pub backoff_max_ms: u64,
+    pub jitter_ms: u64,
+    pub on_status: String,
+    pub on_class: Vec<String>,
+    pub cloudflare_challenge_cooldown_secs: u64,
+    pub cloudflare_timeout_cooldown_secs: u64,
+    pub transport_cooldown_secs: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 2,
+            backoff_ms: 200,
+            backoff_max_ms: 2_000,
+            jitter_ms: 100,
+            on_status: "502,503,504,524".to_string(),
+            on_class: vec![
+                "upstream_transport_error".to_string(),
+                "cloudflare_timeout".to_string(),
+                "cloudflare_challenge".to_string(),
+            ],
+            cloudflare_challenge_cooldown_secs: 300,
+            cloudflare_timeout_cooldown_secs: 60,
+            transport_cooldown_secs: 30,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProxyConfig {
     /// Optional config schema version for future migrations
@@ -112,6 +145,9 @@ pub struct ProxyConfig {
     /// Claude Code 等其他服务配置，后续扩展
     #[serde(default)]
     pub claude: ServiceConfigManager,
+    /// Global retry policy (can be overridden by env vars)
+    #[serde(default)]
+    pub retry: RetryConfig,
     /// 默认目标服务（用于 CLI 默认选择 codex/claude）
     #[serde(default)]
     pub default_service: Option<ServiceKind>,

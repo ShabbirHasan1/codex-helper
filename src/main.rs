@@ -6,6 +6,8 @@ mod lb;
 mod logging;
 mod proxy;
 mod sessions;
+mod state;
+mod tui;
 mod usage;
 mod usage_providers;
 
@@ -17,6 +19,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{
@@ -79,6 +82,9 @@ enum Command {
         /// Listen port (3211 for Codex, 3210 for Claude by default)
         #[arg(long)]
         port: Option<u16>,
+        /// Disable built-in TUI dashboard (enabled by default when running in an interactive terminal)
+        #[arg(long)]
+        no_tui: bool,
     },
     /// Manage Codex/Claude switch-on/off state
     Switch {
@@ -303,16 +309,14 @@ async fn main() {
 }
 
 async fn real_main() -> CliResult<()> {
-    // 默认启用 info 级别日志，若用户设置了 RUST_LOG 则按其配置。
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
-
     let cli = Cli::parse();
+    let _log_guard = init_tracing(&cli);
 
     match cli.command.unwrap_or(Command::Serve {
         port: None,
         codex: false,
         claude: false,
+        no_tui: false,
     }) {
         Command::Default { codex, claude } => {
             handle_default_cmd(codex, claude).await?;
@@ -374,6 +378,7 @@ async fn real_main() -> CliResult<()> {
             port,
             codex,
             claude,
+            no_tui,
         } => {
             if codex && claude {
                 return Err(CliError::Other(
@@ -381,7 +386,7 @@ async fn real_main() -> CliResult<()> {
                 ));
             }
 
-            // 显式指定优先；否则根据配置中的 default_service 决定默认服务（缺省为 Codex）。
+            // Explicit flags win; otherwise decide based on default_service (fallback: Codex).
             let service_name = if claude {
                 "claude"
             } else if codex {
@@ -402,7 +407,7 @@ async fn real_main() -> CliResult<()> {
                 }
             };
             let port = port.unwrap_or_else(|| if service_name == "codex" { 3211 } else { 3210 });
-            run_server(service_name, port)
+            run_server(service_name, port, !no_tui)
                 .await
                 .map_err(|e| CliError::Other(e.to_string()))?;
         }
@@ -411,10 +416,45 @@ async fn real_main() -> CliResult<()> {
     Ok(())
 }
 
-async fn run_server(service_name: &'static str, port: u16) -> anyhow::Result<()> {
-    // Codex 模式下，自动将 Codex 切换到本地代理；Claude 模式也会尝试修改 settings.json（实验性）。
+fn init_tracing(cli: &Cli) -> Option<WorkerGuard> {
+    // Default to info logs unless the user sets RUST_LOG.
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    // When the built-in TUI is enabled, writing logs to the same terminal will cause flicker and
+    // "bleeding" output. In that case, redirect tracing output to a file by default.
+    let interactive_tui = match &cli.command {
+        Some(Command::Serve { no_tui, .. }) => {
+            !*no_tui && atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout)
+        }
+        None => atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout),
+        _ => false,
+    };
+
+    if interactive_tui {
+        let log_dir = crate::config::proxy_home_dir().join("logs");
+        let _ = std::fs::create_dir_all(&log_dir);
+        let file_appender = tracing_appender::rolling::never(&log_dir, "runtime.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_ansi(false)
+            .with_writer(non_blocking)
+            .init();
+        Some(guard)
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        None
+    }
+}
+
+async fn run_server(service_name: &'static str, port: u16, enable_tui: bool) -> anyhow::Result<()> {
+    let interactive = enable_tui && atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout);
+
+    // In Codex mode, automatically switch Codex to the local proxy; in Claude mode, try updating
+    // settings.json as well (experimental).
     if service_name == "codex" {
-        // 在切换前做一次守护性检查：如发现 Codex 已指向本地代理且存在备份，则在交互模式下询问是否先恢复。
+        // Guard before switching: if Codex is already pointing to the local proxy and a backup exists,
+        // ask whether to restore first (interactive only).
         if let Err(err) = codex_integration::guard_codex_config_before_switch_on_interactive() {
             tracing::warn!("Failed to guard Codex config before switch-on: {}", err);
         }
@@ -449,8 +489,8 @@ async fn run_server(service_name: &'static str, port: u16) -> anyhow::Result<()>
         _ => Arc::new(load_or_bootstrap_for_service(ServiceKind::Codex).await?),
     };
 
-    // 严格要求存在至少一个有效的上游配置，否则直接报错退出，
-    // 避免在运行时才发现无可用上游。
+    // Require at least one valid upstream config, so we fail fast instead of discovering
+    // it during an actual user request.
     if service_name == "codex" {
         if cfg.codex.configs.is_empty() || cfg.codex.active_config().is_none() {
             anyhow::bail!(
@@ -467,11 +507,12 @@ async fn run_server(service_name: &'static str, port: u16) -> anyhow::Result<()>
     }
     let client = Client::builder().build()?;
 
-    // 统一的 LB 状态（失败计数、冷却、用量状态）
+    // Shared LB state (failure counters, cooldowns, usage flags).
     let lb_states = Arc::new(Mutex::new(HashMap::new()));
 
-    // 根据 service_name 选择对应服务配置。
+    // Select service config based on service_name.
     let proxy = ProxyService::new(client, cfg.clone(), service_name, lb_states.clone());
+    let state = proxy.state_handle();
     let app: Router = proxy_router(proxy);
 
     let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -481,12 +522,94 @@ async fn run_server(service_name: &'static str, port: u16) -> anyhow::Result<()>
         service_name
     );
 
-    axum::serve(
-        tokio::net::TcpListener::bind(addr).await?,
-        app.into_make_service(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    {
+        let shutdown_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            wait_for_shutdown_signal().await;
+            let _ = shutdown_tx.send(true);
+        });
+    }
+
+    let result = if interactive {
+        let server_shutdown = {
+            let mut rx = shutdown_rx.clone();
+            async move {
+                let _ = rx.changed().await;
+            }
+        };
+        let mut server_handle = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .with_graceful_shutdown(server_shutdown)
+                .await
+        });
+
+        let mut tui_handle = tokio::spawn(tui::run_dashboard(
+            state,
+            service_name,
+            port,
+            shutdown_tx.clone(),
+            shutdown_rx.clone(),
+        ));
+
+        tokio::select! {
+            server_res = &mut server_handle => {
+                let _ = shutdown_tx.send(true);
+                let _ = tui_handle.await;
+                server_res.map_err(|e| anyhow::anyhow!("server task join error: {e}"))??;
+                Ok::<(), anyhow::Error>(())
+            }
+            tui_res = &mut tui_handle => {
+                match tui_res {
+                    Ok(Ok(())) => {
+                        // The dashboard requested a shutdown (or exited because shutdown was already triggered).
+                        let _ = shutdown_tx.send(true);
+                        server_handle.await.map_err(|e| anyhow::anyhow!("server task join error: {e}"))??;
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    Ok(Err(err)) => {
+                        // If the dashboard fails (e.g. terminal issues), keep running without it.
+                        tracing::warn!("TUI dashboard failed; continuing without TUI: {}", err);
+                        server_handle.await.map_err(|e| anyhow::anyhow!("server task join error: {e}"))??;
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    Err(join_err) => {
+                        tracing::warn!("TUI task join error; continuing without TUI: {}", join_err);
+                        server_handle.await.map_err(|e| anyhow::anyhow!("server task join error: {e}"))??;
+                        Ok::<(), anyhow::Error>(())
+                    }
+                }
+            }
+        }
+    } else {
+        let server_shutdown = {
+            let mut rx = shutdown_rx.clone();
+            async move {
+                let _ = rx.changed().await;
+            }
+        };
+        axum::serve(listener, app.into_make_service())
+            .with_graceful_shutdown(server_shutdown)
+            .await?;
+        Ok(())
+    };
+
+    // Always try to restore the upstream config on exit; if no backup exists, this is a no-op.
+    if service_name == "claude" {
+        match codex_integration::claude_switch_off() {
+            Ok(()) => tracing::info!("Claude settings restored from backup"),
+            Err(err) => tracing::warn!("Failed to restore Claude settings from backup: {}", err),
+        }
+    } else {
+        match codex_integration::switch_off() {
+            Ok(()) => tracing::info!("Codex config restored from backup"),
+            Err(err) => tracing::warn!("Failed to restore Codex config from backup: {}", err),
+        }
+    }
+
+    result?;
 
     Ok(())
 }
@@ -723,7 +846,7 @@ fn print_claude_switch_status() {
     }
 }
 
-async fn shutdown_signal() {
+async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -738,15 +861,5 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
-    }
-
-    // 优雅退出时自动恢复 Codex 配置
-    match codex_integration::switch_off() {
-        Ok(()) => {
-            tracing::info!("Codex config restored from backup");
-        }
-        Err(err) => {
-            tracing::warn!("Failed to restore Codex config from backup: {}", err);
-        }
     }
 }

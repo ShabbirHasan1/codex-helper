@@ -207,17 +207,31 @@ pub struct RequestLog<'a> {
     pub config_name: &'a str,
     pub upstream_base_url: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageMetrics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_debug: Option<HttpDebugLog>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_debug_ref: Option<HttpDebugRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryInfo>,
 }
 
 #[derive(Debug, Serialize, Clone)]
 pub struct HttpDebugRef {
     pub id: String,
     pub file: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct RetryInfo {
+    pub attempts: u32,
+    pub upstream_chain: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -232,7 +246,15 @@ struct HttpDebugLogEntry<'a> {
     pub config_name: &'a str,
     pub upstream_base_url: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageMetrics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryInfo>,
     pub http_debug: HttpDebugLog,
 }
 
@@ -342,7 +364,11 @@ pub fn log_request_with_debug(
     duration_ms: u64,
     config_name: &str,
     upstream_base_url: &str,
+    session_id: Option<String>,
+    cwd: Option<String>,
+    reasoning_effort: Option<String>,
     usage: Option<UsageMetrics>,
+    retry: Option<RetryInfo>,
     http_debug: Option<HttpDebugLog>,
 ) {
     let opt = request_log_options();
@@ -385,7 +411,11 @@ pub fn log_request_with_debug(
             duration_ms,
             config_name,
             upstream_base_url,
+            session_id: session_id.clone(),
+            cwd: cwd.clone(),
+            reasoning_effort: reasoning_effort.clone(),
             usage: usage.clone(),
+            retry: retry.clone(),
             http_debug: h,
         };
 
@@ -427,9 +457,13 @@ pub fn log_request_with_debug(
         duration_ms,
         config_name,
         upstream_base_url,
+        session_id,
+        cwd,
+        reasoning_effort,
         usage,
         http_debug: http_debug_for_main,
         http_debug_ref,
+        retry,
     };
 
     rotate_and_prune_if_needed(&log_file_path, opt);

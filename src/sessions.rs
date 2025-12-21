@@ -126,6 +126,61 @@ pub async fn search_codex_sessions_for_current_dir(
     search_codex_sessions_for_dir(&cwd, query, limit).await
 }
 
+/// Find a Codex session's cwd by its session id (UUID suffix in rollout filename).
+///
+/// This is best-effort and scans session files from newest to oldest until it finds a match.
+pub async fn find_codex_session_cwd_by_id(session_id: &str) -> Result<Option<String>> {
+    let root = codex_sessions_dir();
+    if !root.exists() {
+        return Ok(None);
+    }
+
+    let year_dirs = collect_dirs_desc(&root, |s| s.parse::<u32>().ok()).await?;
+    for (_year, year_path) in year_dirs {
+        let month_dirs = collect_dirs_desc(&year_path, |s| s.parse::<u8>().ok()).await?;
+        for (_month, month_path) in month_dirs {
+            let day_dirs = collect_dirs_desc(&month_path, |s| s.parse::<u8>().ok()).await?;
+            for (_day, day_path) in day_dirs {
+                let day_files = collect_rollout_files_sorted(&day_path).await?;
+                for path in day_files {
+                    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    let Some((_ts, uuid)) = parse_timestamp_and_uuid(name) else {
+                        continue;
+                    };
+                    if uuid != session_id {
+                        continue;
+                    }
+
+                    let file = fs::File::open(&path)
+                        .await
+                        .with_context(|| format!("failed to open session file {:?}", path))?;
+                    let reader = BufReader::new(file);
+                    let mut lines = reader.lines();
+                    while let Some(line) = lines.next_line().await? {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let value: Value = match serde_json::from_str(line) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        if let Some(meta) = parse_session_meta(&value) {
+                            return Ok(meta.cwd);
+                        }
+                    }
+
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 async fn summarize_session_for_current_dir(
     path: &Path,
     cwd: &Path,
