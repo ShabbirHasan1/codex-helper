@@ -290,6 +290,14 @@ fn read_file_if_exists(path: &Path) -> Result<Option<String>> {
     Ok(Some(s))
 }
 
+fn is_codex_absent_backup_sentinel(text: &str) -> bool {
+    text.trim() == "# codex-helper-backup:absent"
+}
+
+fn is_claude_absent_backup_sentinel(text: &str) -> bool {
+    text.trim() == "{\"__codex_helper_backup_absent\":true}"
+}
+
 /// Try to infer a unique API key from ~/.codex/auth.json when the provider
 /// does not declare an explicit `env_key`.
 ///
@@ -325,7 +333,9 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
     // 写成本地 provider（codex_proxy）时出现“自我转发”。
     let backup_path = codex_backup_config_path();
     let cfg_path = codex_config_path();
-    let cfg_text_opt = if let Some(text) = read_file_if_exists(&backup_path)? {
+    let cfg_text_opt = if let Some(text) = read_file_if_exists(&backup_path)?
+        && !is_codex_absent_backup_sentinel(&text)
+    {
         Some(text)
     } else {
         read_file_if_exists(&cfg_path)?
@@ -468,7 +478,9 @@ fn bootstrap_from_claude(cfg: &mut ProxyConfig) -> Result<()> {
     let settings_path = claude_settings_path();
     let backup_path = claude_settings_backup_path();
     // Claude 配置同样优先从备份读取，避免将代理指向自身（本地 codex-helper）。
-    let settings_text_opt = if let Some(text) = read_file_if_exists(&backup_path)? {
+    let settings_text_opt = if let Some(text) = read_file_if_exists(&backup_path)?
+        && !is_claude_absent_backup_sentinel(&text)
+    {
         Some(text)
     } else {
         read_file_if_exists(&settings_path)?
@@ -494,12 +506,22 @@ fn bootstrap_from_claude(cfg: &mut ProxyConfig) -> Result<()> {
         .and_then(|v| v.as_object())
         .ok_or_else(|| anyhow::anyhow!("Claude settings 中缺少 env 对象"))?;
 
-    let api_key = env_obj
+    let api_key_env = if env_obj
         .get("ANTHROPIC_AUTH_TOKEN")
-        .or_else(|| env_obj.get("ANTHROPIC_API_KEY"))
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
+        .is_some()
+    {
+        Some("ANTHROPIC_AUTH_TOKEN".to_string())
+    } else if env_obj
+        .get("ANTHROPIC_API_KEY")
+        .and_then(|v| v.as_str())
+        .is_some()
+    {
+        Some("ANTHROPIC_API_KEY".to_string())
+    } else {
+        None
+    }
+    .ok_or_else(|| {
             anyhow::anyhow!(
                 "Claude settings 中缺少 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY；请先在 Claude Code 中完成登录或配置 API Key"
             )
@@ -528,10 +550,10 @@ fn bootstrap_from_claude(cfg: &mut ProxyConfig) -> Result<()> {
     let upstream = UpstreamConfig {
         base_url,
         auth: UpstreamAuth {
-            auth_token: Some(api_key),
+            auth_token: None,
             auth_token_env: None,
             api_key: None,
-            api_key_env: None,
+            api_key_env: Some(api_key_env),
         },
         tags,
     };

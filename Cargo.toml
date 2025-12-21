@@ -41,7 +41,7 @@ clap = { version = "4.5.53", features = ["derive"] }
 regex = "1.12.2"
 atty = "0.2.14"
 owo-colors = "4.2.3"
-crossterm = "0.28.1"
+iocraft = "0.7.16"
 
 [package.metadata.binstall]
 # `cargo-binstall` provides `{ repo }` as a full URL (e.g. https://github.com/OWNER/REPO),

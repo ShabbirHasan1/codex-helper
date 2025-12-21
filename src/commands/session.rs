@@ -94,7 +94,9 @@ pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
         }
         SessionCommand::Export { id, format, output } => {
             // For now, only lookup by scanning all sessions under current dir.
-            let cwd = std::env::current_dir().expect("failed to resolve current directory");
+            let cwd = std::env::current_dir().map_err(|e| {
+                crate::CliError::Other(format!("failed to resolve current directory: {e}"))
+            })?;
             let sessions = find_codex_sessions_for_dir(&cwd, usize::MAX).await?;
             let Some(sess) = sessions.into_iter().find(|s| s.id == id) else {
                 println!("Session with id {} not found under ~/.codex/sessions", id);

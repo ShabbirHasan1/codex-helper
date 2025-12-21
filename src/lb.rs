@@ -58,7 +58,10 @@ impl LoadBalancer {
             return None;
         }
 
-        let mut map = self.states.lock().expect("lb state mutex poisoned");
+        let mut map = match self.states.lock() {
+            Ok(m) => m,
+            Err(e) => e.into_inner(),
+        };
         let entry = map.entry(self.service.name.clone()).or_default();
         entry.ensure_len(self.service.upstreams.len());
 

@@ -35,6 +35,16 @@ fn env_bool(key: &str) -> bool {
     )
 }
 
+fn env_bool_default(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "y" | "on"
+        ),
+        Err(_) => default,
+    }
+}
+
 pub fn http_debug_options() -> HttpDebugOptions {
     static OPT: OnceLock<HttpDebugOptions> = OnceLock::new();
     *OPT.get_or_init(|| {
@@ -56,13 +66,15 @@ pub fn http_debug_options() -> HttpDebugOptions {
 pub fn http_warn_options() -> HttpWarnOptions {
     static OPT: OnceLock<HttpWarnOptions> = OnceLock::new();
     *OPT.get_or_init(|| {
-        let enabled = env_bool("CODEX_HELPER_HTTP_WARN");
-        let all = env_bool("CODEX_HELPER_HTTP_WARN_ALL");
+        // Default ON: for non-2xx, record a small header/body preview to help debug upstream errors.
+        // Set CODEX_HELPER_HTTP_WARN=0 to disable.
+        let enabled = env_bool_default("CODEX_HELPER_HTTP_WARN", true);
+        let all = env_bool_default("CODEX_HELPER_HTTP_WARN_ALL", false);
         let max_body_bytes = std::env::var("CODEX_HELPER_HTTP_WARN_BODY_MAX")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or_else(|| http_debug_options().max_body_bytes);
+            .unwrap_or(8 * 1024);
         HttpWarnOptions {
             enabled,
             all,
@@ -97,6 +109,16 @@ pub fn should_include_http_warn(status_code: u16) -> bool {
 pub struct HeaderEntry {
     pub name: String,
     pub value: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct AuthResolutionLog {
+    /// Where the upstream `Authorization` header value came from (never includes the secret).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<String>,
+    /// Where the upstream `X-API-Key` header value came from (never includes the secret).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_api_key: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -184,6 +206,8 @@ pub struct HttpDebugLog {
     pub target_url: String,
     pub client_headers: Vec<HeaderEntry>,
     pub upstream_request_headers: Vec<HeaderEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_resolution: Option<AuthResolutionLog>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_body: Option<BodyPreview>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -281,7 +305,7 @@ fn log_lock() -> &'static Mutex<()> {
 fn http_debug_split_enabled() -> bool {
     // When HTTP debug is enabled for all requests, splitting is strongly recommended to keep
     // the main request log lightweight. Users can also enable splitting explicitly.
-    env_bool("CODEX_HELPER_HTTP_DEBUG_SPLIT") || http_debug_options().all
+    env_bool_default("CODEX_HELPER_HTTP_DEBUG_SPLIT", true) || http_debug_options().all
 }
 
 fn request_log_options() -> RequestLogOptions {

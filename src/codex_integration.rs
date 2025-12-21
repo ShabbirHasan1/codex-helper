@@ -7,6 +7,8 @@ use anyhow::{Context, Result, anyhow};
 use dirs::home_dir;
 use toml::Value;
 
+const ABSENT_BACKUP_SENTINEL: &str = "# codex-helper-backup:absent";
+
 fn codex_home() -> PathBuf {
     if let Ok(dir) = env::var("CODEX_HOME") {
         return PathBuf::from(dir);
@@ -59,6 +61,10 @@ pub fn switch_on(port: u16) -> Result<()> {
     if cfg_path.exists() && !backup_path.exists() {
         fs::copy(&cfg_path, &backup_path)
             .with_context(|| format!("backup {:?} -> {:?}", cfg_path, backup_path))?;
+    } else if !cfg_path.exists() && !backup_path.exists() {
+        // If Codex has no config.toml yet, create a sentinel backup so we can restore
+        // to the "absent" state on switch_off.
+        atomic_write(&backup_path, ABSENT_BACKUP_SENTINEL)?;
     }
 
     let text = read_config_text(&cfg_path)?;
@@ -99,8 +105,16 @@ pub fn switch_off() -> Result<()> {
     let cfg_path = codex_config_path();
     let backup_path = codex_config_backup_path();
     if backup_path.exists() {
-        fs::copy(&backup_path, &cfg_path)
-            .with_context(|| format!("restore {:?} -> {:?}", backup_path, cfg_path))?;
+        let text = read_config_text(&backup_path)?;
+        if text.trim() == ABSENT_BACKUP_SENTINEL {
+            if cfg_path.exists() {
+                fs::remove_file(&cfg_path)
+                    .with_context(|| format!("remove {:?} (restore absent)", cfg_path))?;
+            }
+        } else {
+            fs::copy(&backup_path, &cfg_path)
+                .with_context(|| format!("restore {:?} -> {:?}", backup_path, cfg_path))?;
+        }
     }
     Ok(())
 }
@@ -252,6 +266,8 @@ fn claude_settings_backup_path(path: &Path) -> PathBuf {
     backup
 }
 
+const CLAUDE_ABSENT_BACKUP_SENTINEL: &str = "{\"__codex_helper_backup_absent\":true}";
+
 fn read_settings_text(path: &Path) -> Result<String> {
     if !path.exists() {
         return Ok(String::new());
@@ -275,6 +291,14 @@ pub fn claude_switch_on(port: u16) -> Result<()> {
                 settings_path, backup_path
             )
         })?;
+    } else if !settings_path.exists() && !backup_path.exists() {
+        // If Claude Code has no settings yet, create a sentinel backup so we can restore
+        // to the "absent" state on claude_switch_off.
+        if let Some(parent) = backup_path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create_dir_all {:?}", parent))?;
+        }
+        fs::write(&backup_path, CLAUDE_ABSENT_BACKUP_SENTINEL)
+            .with_context(|| format!("write {:?}", backup_path))?;
     }
 
     let text = read_settings_text(&settings_path)?;
@@ -327,12 +351,20 @@ pub fn claude_switch_off() -> Result<()> {
     let settings_path = claude_settings_path();
     let backup_path = claude_settings_backup_path(&settings_path);
     if backup_path.exists() {
-        fs::copy(&backup_path, &settings_path)
-            .with_context(|| format!("restore {:?} -> {:?}", backup_path, settings_path))?;
-        eprintln!(
-            "[EXPERIMENTAL] Restored Claude settings from backup {:?}",
-            backup_path
-        );
+        let text = read_settings_text(&backup_path)?;
+        if text.trim() == CLAUDE_ABSENT_BACKUP_SENTINEL {
+            if settings_path.exists() {
+                fs::remove_file(&settings_path)
+                    .with_context(|| format!("remove {:?} (restore absent)", settings_path))?;
+            }
+        } else {
+            fs::copy(&backup_path, &settings_path)
+                .with_context(|| format!("restore {:?} -> {:?}", backup_path, settings_path))?;
+            eprintln!(
+                "[EXPERIMENTAL] Restored Claude settings from backup {:?}",
+                backup_path
+            );
+        }
     }
     Ok(())
 }

@@ -1,6 +1,34 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2025-12-21
+### Added
+- Upstream retry with LB-aware failover (avoid previously-failed upstreams in the same request, and apply cooldown penalties for Cloudflare-like failures).
+- Retry metadata in request logs: `retry.attempts` and `retry.upstream_chain` (only present when retries actually happen).
+- Global retry config in `~/.codex-helper/config.json` under `retry` (env vars can override at runtime).
+- Built-in TUI dashboard (iocraft-based; auto-enabled in interactive terminals; disable with `codex-helper serve --no-tui`).
+- Runtime-only session overrides for `reasoning.effort` (applied to subsequent requests of the same Codex session; not persisted across restarts).
+- Effort menu supports `low`/`medium`/`high`/`xhigh` and clear.
+- Local control/status endpoints for the dashboard and debugging:
+  - `GET/POST /__codex_helper/override/session`
+  - `GET /__codex_helper/status/active`
+  - `GET /__codex_helper/status/recent`
+- Extra request log fields: `session_id`, `cwd`, and `reasoning_effort` when available.
+- Non-2xx requests include a small header/body preview in logs by default (disable via `CODEX_HELPER_HTTP_WARN=0`).
+- `http_debug.auth_resolution` records where upstream auth headers came from (never includes secrets), to help diagnose auth/config issues.
+- `http_debug` is split to `requests_debug.jsonl` by default (disable via `CODEX_HELPER_HTTP_DEBUG_SPLIT=0`).
+- `runtime.log` auto-rotates on startup when running with the built-in TUI (size/retention via `CODEX_HELPER_RUNTIME_LOG_MAX_BYTES` / `CODEX_HELPER_RUNTIME_LOG_MAX_FILES`).
+
+### Changed
+- Streaming responses are only proxied as SSE when upstream is `2xx`; non-2xx responses are buffered to enable classification/logging and optional retry before returning to the client.
+- Retry defaults to 2 attempts; set `CODEX_HELPER_RETRY_MAX_ATTEMPTS=1` to disable.
+
+### Fixed
+- `cargo-binstall` metadata: correct `pkg-url`/`bin-dir` templates to match cargo-dist GitHub release artifacts (including Windows `.zip` layout), so `cargo binstall codex-helper` downloads binaries instead of building from source.
+- Streaming requests now always clear `active_requests` and emit a final `finish_request` entry (fixes TUI stuck active sessions).
+- `serve` always restores Codex/Claude config from backup on exit, even when startup fails after switching on.
+- `switch on/off` now restores correctly when the original Codex/Claude config file did not exist (uses an "absent" sentinel backup instead of leaving clients pointed at a dead proxy).
+
 ## [0.2.0] - 2025-12-20
 ### Added
 - Safe-by-default auth config: store secrets via env vars using `auth_token_env` / `api_key_env` (instead of writing tokens to disk).
@@ -23,22 +51,3 @@ All notable changes to this project will be documented in this file.
 - Request body filter fallback for invalid regex rules (avoid corrupting payloads).
 - Session rollout filename UUID parsing, and deterministic `active_config()` fallback selection.
 
-## [0.3.0] - 2025-12-21
-### Added
-- Upstream retry with LB-aware failover (avoid previously-failed upstreams in the same request, and apply cooldown penalties for Cloudflare-like failures).
-- Retry metadata in request logs: `retry.attempts` and `retry.upstream_chain` (only present when retries actually happen).
-- Global retry config in `~/.codex-helper/config.json` under `retry` (env vars can override at runtime).
-- Built-in TUI dashboard (auto-enabled in interactive terminals; disable with `codex-helper serve --no-tui`).
-- Runtime-only session overrides for `reasoning.effort` (applied to subsequent requests of the same Codex session; not persisted across restarts).
-- Local control/status endpoints for the dashboard and debugging:
-  - `GET/POST /__codex_helper/override/session`
-  - `GET /__codex_helper/status/active`
-  - `GET /__codex_helper/status/recent`
-- Extra request log fields: `session_id`, `cwd`, and `reasoning_effort` when available.
-
-### Changed
-- Streaming responses are only proxied as SSE when upstream is `2xx`; non-2xx responses are buffered to enable classification/logging and optional retry before returning to the client.
-- Retry defaults to 2 attempts; set `CODEX_HELPER_RETRY_MAX_ATTEMPTS=1` to disable.
-
-### Fixed
-- `cargo-binstall` metadata: correct `pkg-url`/`bin-dir` templates to match cargo-dist GitHub release artifacts (including Windows `.zip` layout), so `cargo binstall codex-helper` downloads binaries instead of building from source.

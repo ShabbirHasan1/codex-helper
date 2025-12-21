@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct UsageMetrics {
     #[serde(default)]
     pub input_tokens: i64,
@@ -11,6 +11,15 @@ pub struct UsageMetrics {
     pub reasoning_tokens: i64,
     #[serde(default)]
     pub total_tokens: i64,
+}
+
+impl UsageMetrics {
+    pub fn add_assign(&mut self, other: &UsageMetrics) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+    }
 }
 
 fn to_i64(v: &Value) -> i64 {

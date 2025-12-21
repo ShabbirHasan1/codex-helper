@@ -19,12 +19,138 @@ use crate::config::{ProxyConfig, RetryConfig, ServiceConfigManager};
 use crate::filter::RequestFilter;
 use crate::lb::{LbState, LoadBalancer, SelectedUpstream};
 use crate::logging::{
-    BodyPreview, HeaderEntry, HttpDebugLog, RetryInfo, http_debug_options, http_warn_options,
-    log_request_with_debug, make_body_preview, should_include_http_debug, should_include_http_warn,
+    AuthResolutionLog, BodyPreview, HeaderEntry, HttpDebugLog, RetryInfo, http_debug_options,
+    http_warn_options, log_request_with_debug, make_body_preview, should_include_http_debug,
+    should_include_http_warn,
 };
 use crate::state::{ActiveRequest, FinishedRequest, ProxyState};
 use crate::usage::extract_usage_from_bytes;
 use crate::usage_providers;
+
+fn read_json_file(path: &std::path::Path) -> Option<serde_json::Value> {
+    let bytes = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    if text.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str(&text).ok()
+}
+
+fn codex_auth_json_value(key: &str) -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<serde_json::Value>> = std::sync::OnceLock::new();
+    let v = CACHE.get_or_init(|| read_json_file(&crate::config::codex_auth_path()));
+    let obj = v.as_ref()?.as_object()?;
+    obj.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
+}
+
+fn claude_settings_env_value(key: &str) -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<serde_json::Value>> = std::sync::OnceLock::new();
+    let v = CACHE.get_or_init(|| read_json_file(&crate::config::claude_settings_path()));
+    let obj = v.as_ref()?.as_object()?;
+    let env_obj = obj.get("env")?.as_object()?;
+    env_obj
+        .get(key)
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+}
+
+fn resolve_auth_token_with_source(
+    service_name: &str,
+    auth: &crate::config::UpstreamAuth,
+    client_has_auth: bool,
+) -> (Option<String>, String) {
+    if let Some(token) = auth.auth_token.as_deref()
+        && !token.trim().is_empty()
+    {
+        return (Some(token.to_string()), "inline".to_string());
+    }
+
+    if let Some(env_name) = auth.auth_token_env.as_deref()
+        && !env_name.trim().is_empty()
+    {
+        if let Ok(v) = std::env::var(env_name)
+            && !v.trim().is_empty()
+        {
+            return (Some(v), format!("env:{env_name}"));
+        }
+
+        let file_value = match service_name {
+            "codex" => codex_auth_json_value(env_name),
+            "claude" => claude_settings_env_value(env_name),
+            _ => None,
+        };
+        if let Some(v) = file_value
+            && !v.trim().is_empty()
+        {
+            let src = match service_name {
+                "codex" => format!("codex_auth_json:{env_name}"),
+                "claude" => format!("claude_settings_env:{env_name}"),
+                _ => format!("file:{env_name}"),
+            };
+            return (Some(v), src);
+        }
+
+        if client_has_auth {
+            return (None, format!("client_passthrough (missing_env:{env_name})"));
+        }
+        return (None, format!("missing_env:{env_name}"));
+    }
+
+    if client_has_auth {
+        (None, "client_passthrough".to_string())
+    } else {
+        (None, "none".to_string())
+    }
+}
+
+fn resolve_api_key_with_source(
+    service_name: &str,
+    auth: &crate::config::UpstreamAuth,
+    client_has_x_api_key: bool,
+) -> (Option<String>, String) {
+    if let Some(key) = auth.api_key.as_deref()
+        && !key.trim().is_empty()
+    {
+        return (Some(key.to_string()), "inline".to_string());
+    }
+
+    if let Some(env_name) = auth.api_key_env.as_deref()
+        && !env_name.trim().is_empty()
+    {
+        if let Ok(v) = std::env::var(env_name)
+            && !v.trim().is_empty()
+        {
+            return (Some(v), format!("env:{env_name}"));
+        }
+
+        let file_value = match service_name {
+            "codex" => codex_auth_json_value(env_name),
+            "claude" => claude_settings_env_value(env_name),
+            _ => None,
+        };
+        if let Some(v) = file_value
+            && !v.trim().is_empty()
+        {
+            let src = match service_name {
+                "codex" => format!("codex_auth_json:{env_name}"),
+                "claude" => format!("claude_settings_env:{env_name}"),
+                _ => format!("file:{env_name}"),
+            };
+            return (Some(v), src);
+        }
+
+        if client_has_x_api_key {
+            return (None, format!("client_passthrough (missing_env:{env_name})"));
+        }
+        return (None, format!("missing_env:{env_name}"));
+    }
+
+    if client_has_x_api_key {
+        (None, "client_passthrough".to_string())
+    } else {
+        (None, "none".to_string())
+    }
+}
 
 fn header_value_str(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
@@ -195,6 +321,7 @@ struct HttpDebugBase {
     target_url: String,
     client_headers: Vec<HeaderEntry>,
     upstream_request_headers: Vec<HeaderEntry>,
+    auth_resolution: Option<AuthResolutionLog>,
     client_body_debug: Option<BodyPreview>,
     upstream_request_body_debug: Option<BodyPreview>,
     client_body_warn: Option<BodyPreview>,
@@ -457,6 +584,13 @@ fn extract_reasoning_effort_from_request_body(body: &[u8]) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn extract_model_from_request_body(body: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    v.get("model")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string())
+}
+
 fn apply_reasoning_effort_override(body: &[u8], effort: &str) -> Option<Vec<u8>> {
     let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let reasoning = v.get_mut("reasoning").and_then(|r| r.as_object_mut());
@@ -487,16 +621,64 @@ pub async fn handle_proxy(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let lb = proxy.lb().ok_or_else(|| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "no active upstream config".to_string(),
-        )
-    })?;
 
     let uri = req.uri().clone();
     let method = req.method().clone();
     let client_headers = req.headers().clone();
+    let client_headers_entries = header_map_to_entries(&client_headers);
+
+    let session_id = extract_session_id(&client_headers);
+
+    let lb = match proxy.lb() {
+        Some(lb) => lb,
+        None => {
+            let dur = start.elapsed().as_millis() as u64;
+            let status = StatusCode::BAD_GATEWAY;
+            let http_debug = if should_include_http_warn(status.as_u16()) {
+                Some(HttpDebugLog {
+                    request_body_len: None,
+                    upstream_request_body_len: None,
+                    upstream_headers_ms: None,
+                    upstream_first_chunk_ms: None,
+                    upstream_body_read_ms: None,
+                    upstream_error_class: Some("no_active_upstream_config".to_string()),
+                    upstream_error_hint: Some(
+                        "未找到任何可用的上游配置（active_config 为空或 upstreams 为空）。"
+                            .to_string(),
+                    ),
+                    upstream_cf_ray: None,
+                    client_uri: uri.to_string(),
+                    target_url: "-".to_string(),
+                    client_headers: client_headers_entries.clone(),
+                    upstream_request_headers: Vec::new(),
+                    auth_resolution: None,
+                    client_body: None,
+                    upstream_request_body: None,
+                    upstream_response_headers: None,
+                    upstream_response_body: None,
+                    upstream_error: Some("no active upstream config".to_string()),
+                })
+            } else {
+                None
+            };
+            log_request_with_debug(
+                proxy.service_name,
+                method.as_str(),
+                uri.path(),
+                status.as_u16(),
+                dur,
+                "-",
+                "-",
+                session_id.clone(),
+                None,
+                None,
+                None,
+                None,
+                http_debug,
+            );
+            return Err((status, "no active upstream config".to_string()));
+        }
+    };
     let client_content_type = client_headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
@@ -515,7 +697,6 @@ pub async fn handle_proxy(
     let is_user_turn = method == Method::POST && is_responses_path;
     let is_codex_service = proxy.service_name == "codex";
 
-    let session_id = extract_session_id(&client_headers);
     let cwd = if let Some(id) = session_id.as_deref() {
         proxy.state.resolve_session_cwd(id).await
     } else {
@@ -527,9 +708,56 @@ pub async fn handle_proxy(
 
     // Read request body and apply filters.
     let body = req.into_body();
-    let raw_body = to_bytes(body, 10 * 1024 * 1024)
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let raw_body = match to_bytes(body, 10 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            let dur = start.elapsed().as_millis() as u64;
+            let status = StatusCode::BAD_REQUEST;
+            let err_str = e.to_string();
+            let http_debug = if should_include_http_warn(status.as_u16()) {
+                Some(HttpDebugLog {
+                    request_body_len: None,
+                    upstream_request_body_len: None,
+                    upstream_headers_ms: None,
+                    upstream_first_chunk_ms: None,
+                    upstream_body_read_ms: None,
+                    upstream_error_class: Some("client_body_read_error".to_string()),
+                    upstream_error_hint: Some(
+                        "读取客户端请求 body 失败（可能超过大小限制或连接中断）。".to_string(),
+                    ),
+                    upstream_cf_ray: None,
+                    client_uri: uri.to_string(),
+                    target_url: "-".to_string(),
+                    client_headers: client_headers_entries.clone(),
+                    upstream_request_headers: Vec::new(),
+                    auth_resolution: None,
+                    client_body: None,
+                    upstream_request_body: None,
+                    upstream_response_headers: None,
+                    upstream_response_body: None,
+                    upstream_error: Some(err_str.clone()),
+                })
+            } else {
+                None
+            };
+            log_request_with_debug(
+                proxy.service_name,
+                method.as_str(),
+                uri.path(),
+                status.as_u16(),
+                dur,
+                "-",
+                "-",
+                session_id.clone(),
+                cwd.clone(),
+                None,
+                None,
+                None,
+                http_debug,
+            );
+            return Err((status, err_str));
+        }
+    };
     let original_effort = extract_reasoning_effort_from_request_body(&raw_body);
     let override_effort = if let Some(id) = session_id.as_deref() {
         proxy.state.get_session_effort_override(id).await
@@ -543,6 +771,7 @@ pub async fn handle_proxy(
     } else {
         raw_body.to_vec()
     };
+    let request_model = extract_model_from_request_body(&body_for_upstream);
 
     let filtered_body = proxy.filter.apply(&body_for_upstream);
     let request_body_len = raw_body.len();
@@ -560,7 +789,6 @@ pub async fn handle_proxy(
     } else {
         0
     };
-    let client_headers_entries = header_map_to_entries(&client_headers);
     let client_body_debug = if debug_max > 0 {
         Some(make_body_preview(
             &raw_body,
@@ -606,6 +834,7 @@ pub async fn handle_proxy(
             uri.path(),
             session_id.clone(),
             cwd.clone(),
+            request_model.clone(),
             effective_effort.clone(),
             started_at_ms,
         )
@@ -616,34 +845,149 @@ pub async fn handle_proxy(
     let mut upstream_chain: Vec<String> = Vec::new();
 
     for attempt_index in 0..retry_opt.max_attempts {
-        let selected = lb.select_upstream_avoiding(&avoid).ok_or_else(|| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "no upstreams in current config".to_string(),
-            )
-        })?;
+        let upstream_total = lb.service.upstreams.len();
+        if upstream_total > 0 && avoid.len() >= upstream_total {
+            upstream_chain.push(format!("all_upstreams_avoided total={upstream_total}"));
+            break;
+        }
 
-        let (target_url, _) = proxy
-            .build_target(&selected, &uri)
-            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+        let Some(selected) = lb.select_upstream_avoiding(&avoid) else {
+            let dur = start.elapsed().as_millis() as u64;
+            let status = StatusCode::BAD_GATEWAY;
+            log_request_with_debug(
+                proxy.service_name,
+                method.as_str(),
+                uri.path(),
+                status.as_u16(),
+                dur,
+                "-",
+                "-",
+                session_id.clone(),
+                cwd.clone(),
+                effective_effort.clone(),
+                None,
+                retry_info_for_chain(&upstream_chain),
+                None,
+            );
+            proxy
+                .state
+                .finish_request(request_id, status.as_u16(), dur, started_at_ms + dur, None)
+                .await;
+            return Err((status, "no upstreams in current config".to_string()));
+        };
+
+        let target_url = match proxy.build_target(&selected, &uri) {
+            Ok((url, _headers)) => url,
+            Err(e) => {
+                lb.record_result(selected.index, false);
+                let err_str = e.to_string();
+                upstream_chain.push(format!(
+                    "{} (idx={}) target_build_error={}",
+                    selected.upstream.base_url, selected.index, err_str
+                ));
+                avoid.insert(selected.index);
+
+                let can_retry = attempt_index + 1 < retry_opt.max_attempts;
+                if can_retry {
+                    backoff_sleep(&retry_opt, attempt_index).await;
+                    continue;
+                }
+
+                let dur = start.elapsed().as_millis() as u64;
+                let status = StatusCode::BAD_GATEWAY;
+                let http_debug = if should_include_http_warn(status.as_u16()) {
+                    Some(HttpDebugLog {
+                        request_body_len: Some(request_body_len),
+                        upstream_request_body_len: Some(upstream_request_body_len),
+                        upstream_headers_ms: None,
+                        upstream_first_chunk_ms: None,
+                        upstream_body_read_ms: None,
+                        upstream_error_class: Some("target_build_error".to_string()),
+                        upstream_error_hint: Some(
+                            "构造上游 target_url 失败（通常是 base_url 配置错误）。".to_string(),
+                        ),
+                        upstream_cf_ray: None,
+                        client_uri: uri.to_string(),
+                        target_url: "-".to_string(),
+                        client_headers: client_headers_entries.clone(),
+                        upstream_request_headers: Vec::new(),
+                        auth_resolution: None,
+                        client_body: client_body_warn.clone(),
+                        upstream_request_body: upstream_request_body_warn.clone(),
+                        upstream_response_headers: None,
+                        upstream_response_body: None,
+                        upstream_error: Some(err_str.clone()),
+                    })
+                } else {
+                    None
+                };
+                log_request_with_debug(
+                    proxy.service_name,
+                    method.as_str(),
+                    uri.path(),
+                    status.as_u16(),
+                    dur,
+                    &selected.config_name,
+                    &selected.upstream.base_url,
+                    session_id.clone(),
+                    cwd.clone(),
+                    effective_effort.clone(),
+                    None,
+                    retry_info_for_chain(&upstream_chain),
+                    http_debug,
+                );
+                proxy
+                    .state
+                    .finish_request(request_id, status.as_u16(), dur, started_at_ms + dur, None)
+                    .await;
+                return Err((status, err_str));
+            }
+        };
 
         // copy headers, stripping host/content-length and hop-by-hop.
         // auth headers:
         // - if upstream config provides a token/key, override client values;
         // - otherwise, preserve client Authorization / X-API-Key (required for requires_openai_auth=true providers).
         let mut headers = filter_request_headers(&client_headers);
-        if let Some(token) = selected.upstream.auth.resolve_auth_token()
+        let client_has_auth = headers.contains_key("authorization");
+        let (token, token_src) = resolve_auth_token_with_source(
+            proxy.service_name,
+            &selected.upstream.auth,
+            client_has_auth,
+        );
+        if let Some(token) = token
             && let Ok(v) = HeaderValue::from_str(&format!("Bearer {token}"))
         {
             headers.insert(HeaderName::from_static("authorization"), v);
         }
-        if let Some(key) = selected.upstream.auth.resolve_api_key()
+
+        let client_has_x_api_key = headers.contains_key("x-api-key");
+        let (api_key, api_key_src) = resolve_api_key_with_source(
+            proxy.service_name,
+            &selected.upstream.auth,
+            client_has_x_api_key,
+        );
+        if let Some(key) = api_key
             && let Ok(v) = HeaderValue::from_str(&key)
         {
             headers.insert(HeaderName::from_static("x-api-key"), v);
         }
 
         let upstream_request_headers = headers.clone();
+        let provider_id = selected.upstream.tags.get("provider_id").cloned();
+        proxy
+            .state
+            .update_request_route(
+                request_id,
+                selected.config_name.clone(),
+                provider_id.clone(),
+                selected.upstream.base_url.clone(),
+            )
+            .await;
+        let auth_resolution = AuthResolutionLog {
+            authorization: Some(token_src),
+            x_api_key: Some(api_key_src),
+        };
 
         let debug_base = if debug_max > 0 || warn_max > 0 {
             Some(HttpDebugBase {
@@ -655,6 +999,7 @@ pub async fn handle_proxy(
                 target_url: target_url.to_string(),
                 client_headers: client_headers_entries.clone(),
                 upstream_request_headers: header_map_to_entries(&upstream_request_headers),
+                auth_resolution: Some(auth_resolution),
                 client_body_debug: client_body_debug.clone(),
                 upstream_request_body_debug: upstream_request_body_debug.clone(),
                 client_body_warn: client_body_warn.clone(),
@@ -707,37 +1052,7 @@ pub async fn handle_proxy(
                 let upstream_headers_ms = upstream_start.elapsed().as_millis() as u64;
                 let retry = retry_info_for_chain(&upstream_chain);
                 let http_debug_warn = debug_base.as_ref().and_then(|b| {
-                if b.warn_max_body_bytes == 0 {
-                    return None;
-                }
-                Some(HttpDebugLog {
-                    request_body_len: Some(b.request_body_len),
-                    upstream_request_body_len: Some(b.upstream_request_body_len),
-                    upstream_headers_ms: Some(upstream_headers_ms),
-                    upstream_first_chunk_ms: None,
-                    upstream_body_read_ms: None,
-                    upstream_error_class: Some("upstream_transport_error".to_string()),
-                    upstream_error_hint: Some("上游连接/发送请求失败（reqwest 错误）；请检查网络、DNS、TLS、代理设置或上游可用性。".to_string()),
-                    upstream_cf_ray: None,
-                    client_uri: b.client_uri.clone(),
-                    target_url: b.target_url.clone(),
-                    client_headers: b.client_headers.clone(),
-                    upstream_request_headers: b.upstream_request_headers.clone(),
-                    client_body: b.client_body_warn.clone(),
-                    upstream_request_body: b.upstream_request_body_warn.clone(),
-                    upstream_response_headers: None,
-                    upstream_response_body: None,
-                    upstream_error: Some(err_str.clone()),
-                })
-            });
-                if should_include_http_warn(status_code)
-                    && let Some(h) = http_debug_warn.as_ref()
-                {
-                    warn_http_debug(status_code, h);
-                }
-                let http_debug = if should_include_http_debug(status_code) {
-                    debug_base.as_ref().and_then(|b| {
-                    if b.debug_max_body_bytes == 0 {
+                    if b.warn_max_body_bytes == 0 {
                         return None;
                     }
                     Some(HttpDebugLog {
@@ -747,19 +1062,57 @@ pub async fn handle_proxy(
                         upstream_first_chunk_ms: None,
                         upstream_body_read_ms: None,
                         upstream_error_class: Some("upstream_transport_error".to_string()),
-                        upstream_error_hint: Some("上游连接/发送请求失败（reqwest 错误）；请检查网络、DNS、TLS、代理设置或上游可用性。".to_string()),
+                        upstream_error_hint: Some(
+                            "上游连接/发送请求失败（reqwest 错误）；请检查网络、DNS、TLS、代理设置或上游可用性。".to_string(),
+                        ),
                         upstream_cf_ray: None,
                         client_uri: b.client_uri.clone(),
                         target_url: b.target_url.clone(),
                         client_headers: b.client_headers.clone(),
                         upstream_request_headers: b.upstream_request_headers.clone(),
-                        client_body: b.client_body_debug.clone(),
-                        upstream_request_body: b.upstream_request_body_debug.clone(),
+                        auth_resolution: b.auth_resolution.clone(),
+                        client_body: b.client_body_warn.clone(),
+                        upstream_request_body: b.upstream_request_body_warn.clone(),
                         upstream_response_headers: None,
                         upstream_response_body: None,
-                        upstream_error: Some(err_str),
+                        upstream_error: Some(err_str.clone()),
                     })
-                })
+                });
+                if should_include_http_warn(status_code)
+                    && let Some(h) = http_debug_warn.as_ref()
+                {
+                    warn_http_debug(status_code, h);
+                }
+                let http_debug = if should_include_http_debug(status_code) {
+                    debug_base.as_ref().and_then(|b| {
+                        if b.debug_max_body_bytes == 0 {
+                            return None;
+                        }
+                        Some(HttpDebugLog {
+                            request_body_len: Some(b.request_body_len),
+                            upstream_request_body_len: Some(b.upstream_request_body_len),
+                            upstream_headers_ms: Some(upstream_headers_ms),
+                            upstream_first_chunk_ms: None,
+                            upstream_body_read_ms: None,
+                            upstream_error_class: Some("upstream_transport_error".to_string()),
+                            upstream_error_hint: Some(
+                                "上游连接/发送请求失败（reqwest 错误）；请检查网络、DNS、TLS、代理设置或上游可用性。".to_string(),
+                            ),
+                            upstream_cf_ray: None,
+                            client_uri: b.client_uri.clone(),
+                            target_url: b.target_url.clone(),
+                            client_headers: b.client_headers.clone(),
+                            upstream_request_headers: b.upstream_request_headers.clone(),
+                            auth_resolution: b.auth_resolution.clone(),
+                            client_body: b.client_body_debug.clone(),
+                            upstream_request_body: b.upstream_request_body_debug.clone(),
+                            upstream_response_headers: None,
+                            upstream_response_body: None,
+                            upstream_error: Some(err_str.clone()),
+                        })
+                    })
+                } else if should_include_http_warn(status_code) {
+                    http_debug_warn.clone()
                 } else {
                     None
                 };
@@ -780,7 +1133,7 @@ pub async fn handle_proxy(
                 );
                 proxy
                     .state
-                    .finish_request(request_id, status_code, dur, started_at_ms + dur)
+                    .finish_request(request_id, status_code, dur, started_at_ms + dur, None)
                     .await;
                 return Err((StatusCode::BAD_GATEWAY, e.to_string()));
             }
@@ -789,13 +1142,13 @@ pub async fn handle_proxy(
         let upstream_headers_ms = upstream_start.elapsed().as_millis() as u64;
         let status = resp.status();
         let success = status.is_success();
-        lb.record_result(selected.index, success);
         let resp_headers = resp.headers().clone();
         let resp_headers_filtered = filter_response_headers(&resp_headers);
 
         // 对用户对话轮次输出更有信息量的 info 日志（仅最终返回时打印，避免重试期间刷屏）。
 
         if is_stream && success {
+            lb.record_result(selected.index, true);
             upstream_chain.push(format!(
                 "{} (idx={}) status={}",
                 selected.upstream.base_url,
@@ -826,6 +1179,7 @@ pub async fn handle_proxy(
             struct StreamUsageState {
                 buffer: Vec<u8>,
                 logged: bool,
+                finished: bool,
                 warned_non_success: bool,
                 first_chunk_ms: Option<u64>,
             }
@@ -900,6 +1254,7 @@ pub async fn handle_proxy(
                         target_url: b.target_url.clone(),
                         client_headers: b.client_headers.clone(),
                         upstream_request_headers: b.upstream_request_headers.clone(),
+                        auth_resolution: b.auth_resolution.clone(),
                         client_body,
                         upstream_request_body,
                         upstream_response_headers: Some(header_map_to_entries(&self.resp_headers)),
@@ -920,47 +1275,59 @@ pub async fn handle_proxy(
                         Ok(g) => g,
                         Err(_) => return,
                     };
-                    if guard.logged {
+                    if guard.finished {
                         return;
                     }
-                    guard.logged = true;
+                    guard.finished = true;
+                    let already_logged = guard.logged;
+                    let usage_for_state = crate::usage::extract_usage_from_sse_bytes(&guard.buffer);
 
                     let dur = self.start.elapsed().as_millis() as u64;
-                    let usage = crate::usage::extract_usage_from_sse_bytes(&guard.buffer);
-                    let http_debug_warn =
-                        self.build_http_debug(&guard.buffer, guard.first_chunk_ms, true);
-                    if should_include_http_warn(self.status_code)
-                        && !guard.warned_non_success
-                        && let Some(h) = http_debug_warn.as_ref()
-                    {
-                        warn_http_debug(self.status_code, h);
-                        guard.warned_non_success = true;
+
+                    if !already_logged {
+                        guard.logged = true;
+                        let usage = usage_for_state.clone();
+                        let http_debug_warn =
+                            self.build_http_debug(&guard.buffer, guard.first_chunk_ms, true);
+                        if should_include_http_warn(self.status_code)
+                            && !guard.warned_non_success
+                            && let Some(h) = http_debug_warn.as_ref()
+                        {
+                            warn_http_debug(self.status_code, h);
+                            guard.warned_non_success = true;
+                        }
+                        let http_debug = if should_include_http_debug(self.status_code) {
+                            self.build_http_debug(&guard.buffer, guard.first_chunk_ms, false)
+                        } else {
+                            None
+                        };
+                        log_request_with_debug(
+                            &self.service_name,
+                            &self.method,
+                            &self.path,
+                            self.status_code,
+                            dur,
+                            &self.config_name,
+                            &self.upstream_base_url,
+                            self.session_id.clone(),
+                            self.cwd.clone(),
+                            self.reasoning_effort.clone(),
+                            usage,
+                            self.retry.clone(),
+                            http_debug,
+                        );
                     }
-                    let http_debug = if should_include_http_debug(self.status_code) {
-                        self.build_http_debug(&guard.buffer, guard.first_chunk_ms, false)
-                    } else {
-                        None
-                    };
-                    log_request_with_debug(
-                        &self.service_name,
-                        &self.method,
-                        &self.path,
-                        self.status_code,
-                        dur,
-                        &self.config_name,
-                        &self.upstream_base_url,
-                        self.session_id.clone(),
-                        self.cwd.clone(),
-                        self.reasoning_effort.clone(),
-                        usage,
-                        self.retry.clone(),
-                        http_debug,
-                    );
 
                     drop(guard);
                     tokio::spawn(async move {
                         state
-                            .finish_request(request_id, status_code, dur, started_at_ms + dur)
+                            .finish_request(
+                                request_id,
+                                status_code,
+                                dur,
+                                started_at_ms + dur,
+                                usage_for_state,
+                            )
                             .await;
                     });
                 }
@@ -1051,7 +1418,7 @@ pub async fn handle_proxy(
                         warn_http_debug(status_code, &h);
                     } else {
                         warn!(
-                            "upstream returned non-2xx status {} for {} {} (config: {}); set CODEX_HELPER_HTTP_WARN=1 to log headers/body preview",
+                            "upstream returned non-2xx status {} for {} {} (config: {}); set CODEX_HELPER_HTTP_WARN=0 to disable preview logs (or CODEX_HELPER_HTTP_DEBUG=1 for full debug)",
                             status_code, method_s, path_s, config_name
                         );
                     }
@@ -1096,10 +1463,81 @@ pub async fn handle_proxy(
             }
             return Ok(builder.body(body).unwrap());
         } else {
-            let bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            let bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    lb.record_result(selected.index, false);
+                    let err_str = e.to_string();
+                    upstream_chain.push(format!(
+                        "{} (idx={}) body_read_error={}",
+                        selected.upstream.base_url, selected.index, err_str
+                    ));
+                    let can_retry = attempt_index + 1 < retry_opt.max_attempts
+                        && should_retry_class(&retry_opt, Some("upstream_transport_error"));
+                    if can_retry {
+                        lb.penalize(
+                            selected.index,
+                            retry_opt.transport_cooldown_secs,
+                            "upstream_body_read_error",
+                        );
+                        avoid.insert(selected.index);
+                        backoff_sleep(&retry_opt, attempt_index).await;
+                        continue;
+                    }
+
+                    let dur = start.elapsed().as_millis() as u64;
+                    let status = StatusCode::BAD_GATEWAY;
+                    let http_debug = if should_include_http_warn(status.as_u16())
+                        && let Some(b) = debug_base.as_ref()
+                    {
+                        Some(HttpDebugLog {
+                            request_body_len: Some(b.request_body_len),
+                            upstream_request_body_len: Some(b.upstream_request_body_len),
+                            upstream_headers_ms: Some(upstream_headers_ms),
+                            upstream_first_chunk_ms: None,
+                            upstream_body_read_ms: None,
+                            upstream_error_class: Some("upstream_transport_error".to_string()),
+                            upstream_error_hint: Some(
+                                "读取上游响应 body 失败（连接中断/解码错误等）；可视为传输错误。"
+                                    .to_string(),
+                            ),
+                            upstream_cf_ray: None,
+                            client_uri: b.client_uri.clone(),
+                            target_url: b.target_url.clone(),
+                            client_headers: b.client_headers.clone(),
+                            upstream_request_headers: b.upstream_request_headers.clone(),
+                            auth_resolution: b.auth_resolution.clone(),
+                            client_body: b.client_body_warn.clone(),
+                            upstream_request_body: b.upstream_request_body_warn.clone(),
+                            upstream_response_headers: Some(header_map_to_entries(&resp_headers)),
+                            upstream_response_body: None,
+                            upstream_error: Some(err_str.clone()),
+                        })
+                    } else {
+                        None
+                    };
+                    log_request_with_debug(
+                        proxy.service_name,
+                        method.as_str(),
+                        uri.path(),
+                        status.as_u16(),
+                        dur,
+                        &selected.config_name,
+                        &selected.upstream.base_url,
+                        session_id.clone(),
+                        cwd.clone(),
+                        effective_effort.clone(),
+                        None,
+                        retry_info_for_chain(&upstream_chain),
+                        http_debug,
+                    );
+                    proxy
+                        .state
+                        .finish_request(request_id, status.as_u16(), dur, started_at_ms + dur, None)
+                        .await;
+                    return Err((status, err_str));
+                }
+            };
             let upstream_body_read_ms = upstream_start.elapsed().as_millis() as u64;
             let dur = start.elapsed().as_millis() as u64;
             let usage = extract_usage_from_bytes(&bytes);
@@ -1120,6 +1558,21 @@ pub async fn handle_proxy(
                 && (should_retry_status(&retry_opt, status_code)
                     || should_retry_class(&retry_opt, cls.as_deref()));
             if retryable {
+                // Treat retryable 5xx / WAF-like responses as upstream failures for LB tracking.
+                if status_code >= 500 || cls.is_some() {
+                    lb.record_result(selected.index, false);
+                }
+                let cls_s = cls.as_deref().unwrap_or("-");
+                info!(
+                    "retrying after non-2xx status {} (class={}) for {} {} (config: {}, next_attempt={}/{})",
+                    status_code,
+                    cls_s,
+                    method,
+                    uri.path(),
+                    selected.config_name,
+                    attempt_index + 2,
+                    retry_opt.max_attempts
+                );
                 match cls.as_deref() {
                     Some("cloudflare_challenge") => lb.penalize(
                         selected.index,
@@ -1136,6 +1589,17 @@ pub async fn handle_proxy(
                 avoid.insert(selected.index);
                 backoff_sleep(&retry_opt, attempt_index).await;
                 continue;
+            }
+
+            // Update LB state (final attempt):
+            // - 2xx => success
+            // - transport / 5xx / classified WAF failures => failure
+            // - generic 3xx/4xx => neutral (do not mark upstream good/bad to avoid sticky routing to a failing upstream,
+            //   and also avoid penalizing upstreams for client-side mistakes).
+            if success {
+                lb.record_result(selected.index, true);
+            } else if status_code >= 500 || cls.is_some() {
+                lb.record_result(selected.index, false);
             }
 
             let retry = retry_info_for_chain(&upstream_chain);
@@ -1158,42 +1622,48 @@ pub async fn handle_proxy(
                 );
             }
 
+            let http_debug_warn = if should_include_http_warn(status_code)
+                && let Some(b) = debug_base.as_ref()
+            {
+                let max = b.warn_max_body_bytes;
+                let resp_ct = resp_headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok());
+                Some(HttpDebugLog {
+                    request_body_len: Some(b.request_body_len),
+                    upstream_request_body_len: Some(b.upstream_request_body_len),
+                    upstream_headers_ms: Some(upstream_headers_ms),
+                    upstream_first_chunk_ms: None,
+                    upstream_body_read_ms: Some(upstream_body_read_ms),
+                    upstream_error_class: cls.clone(),
+                    upstream_error_hint: hint.clone(),
+                    upstream_cf_ray: cf_ray.clone(),
+                    client_uri: b.client_uri.clone(),
+                    target_url: b.target_url.clone(),
+                    client_headers: b.client_headers.clone(),
+                    upstream_request_headers: b.upstream_request_headers.clone(),
+                    auth_resolution: b.auth_resolution.clone(),
+                    client_body: b.client_body_warn.clone(),
+                    upstream_request_body: b.upstream_request_body_warn.clone(),
+                    upstream_response_headers: Some(header_map_to_entries(&resp_headers)),
+                    upstream_response_body: Some(make_body_preview(bytes.as_ref(), resp_ct, max)),
+                    upstream_error: None,
+                })
+            } else {
+                None
+            };
+
             if !status.is_success() {
-                if should_include_http_warn(status_code)
-                    && let Some(b) = debug_base.as_ref()
-                {
-                    let max = b.warn_max_body_bytes;
-                    let resp_ct = resp_headers
-                        .get("content-type")
-                        .and_then(|v| v.to_str().ok());
-                    let http_debug = HttpDebugLog {
-                        request_body_len: Some(b.request_body_len),
-                        upstream_request_body_len: Some(b.upstream_request_body_len),
-                        upstream_headers_ms: Some(upstream_headers_ms),
-                        upstream_first_chunk_ms: None,
-                        upstream_body_read_ms: Some(upstream_body_read_ms),
-                        upstream_error_class: cls.clone(),
-                        upstream_error_hint: hint.clone(),
-                        upstream_cf_ray: cf_ray.clone(),
-                        client_uri: b.client_uri.clone(),
-                        target_url: b.target_url.clone(),
-                        client_headers: b.client_headers.clone(),
-                        upstream_request_headers: b.upstream_request_headers.clone(),
-                        client_body: b.client_body_warn.clone(),
-                        upstream_request_body: b.upstream_request_body_warn.clone(),
-                        upstream_response_headers: Some(header_map_to_entries(&resp_headers)),
-                        upstream_response_body: Some(make_body_preview(
-                            bytes.as_ref(),
-                            resp_ct,
-                            max,
-                        )),
-                        upstream_error: None,
-                    };
-                    warn_http_debug(status_code, &http_debug);
+                if let Some(h) = http_debug_warn.as_ref() {
+                    warn_http_debug(status_code, h);
                 } else {
+                    let cls_s = cls.as_deref().unwrap_or("-");
+                    let cf_ray_s = cf_ray.as_deref().unwrap_or("-");
                     warn!(
-                        "upstream returned non-2xx status {} for {} {} (config: {}); set CODEX_HELPER_HTTP_WARN=1 to log headers/body preview",
+                        "upstream returned non-2xx status {} (class={}, cf_ray={}) for {} {} (config: {}); set CODEX_HELPER_HTTP_WARN=0 to disable preview logs (or CODEX_HELPER_HTTP_DEBUG=1 for full debug)",
                         status_code,
+                        cls_s,
+                        cf_ray_s,
                         method,
                         uri.path(),
                         selected.config_name
@@ -1220,6 +1690,7 @@ pub async fn handle_proxy(
                         target_url: b.target_url,
                         client_headers: b.client_headers,
                         upstream_request_headers: b.upstream_request_headers,
+                        auth_resolution: b.auth_resolution,
                         client_body: b.client_body_debug,
                         upstream_request_body: b.upstream_request_body_debug,
                         upstream_response_headers: Some(header_map_to_entries(&resp_headers)),
@@ -1231,6 +1702,8 @@ pub async fn handle_proxy(
                         upstream_error: None,
                     }
                 })
+            } else if should_include_http_warn(status_code) {
+                http_debug_warn.clone()
             } else {
                 None
             };
@@ -1252,7 +1725,13 @@ pub async fn handle_proxy(
             );
             proxy
                 .state
-                .finish_request(request_id, status_code, dur, started_at_ms + dur)
+                .finish_request(
+                    request_id,
+                    status_code,
+                    dur,
+                    started_at_ms + dur,
+                    usage.clone(),
+                )
                 .await;
 
             // Poll usage once after a user request finishes (e.g. packycode), used to drive auto-switching.
@@ -1274,10 +1753,55 @@ pub async fn handle_proxy(
         }
     }
 
-    Err((
-        StatusCode::BAD_GATEWAY,
-        "retry attempts exhausted".to_string(),
-    ))
+    let dur = start.elapsed().as_millis() as u64;
+    let status = StatusCode::BAD_GATEWAY;
+    let http_debug = if should_include_http_warn(status.as_u16()) {
+        Some(HttpDebugLog {
+            request_body_len: Some(request_body_len),
+            upstream_request_body_len: Some(upstream_request_body_len),
+            upstream_headers_ms: None,
+            upstream_first_chunk_ms: None,
+            upstream_body_read_ms: None,
+            upstream_error_class: Some("retry_exhausted".to_string()),
+            upstream_error_hint: Some("所有重试尝试均未能返回可用响应。".to_string()),
+            upstream_cf_ray: None,
+            client_uri: uri.to_string(),
+            target_url: "-".to_string(),
+            client_headers: client_headers_entries.clone(),
+            upstream_request_headers: Vec::new(),
+            auth_resolution: None,
+            client_body: client_body_warn.clone(),
+            upstream_request_body: upstream_request_body_warn.clone(),
+            upstream_response_headers: None,
+            upstream_response_body: None,
+            upstream_error: Some(format!(
+                "retry attempts exhausted; chain={:?}",
+                upstream_chain
+            )),
+        })
+    } else {
+        None
+    };
+    log_request_with_debug(
+        proxy.service_name,
+        method.as_str(),
+        uri.path(),
+        status.as_u16(),
+        dur,
+        "-",
+        "-",
+        session_id.clone(),
+        cwd.clone(),
+        effective_effort.clone(),
+        None,
+        retry_info_for_chain(&upstream_chain),
+        http_debug,
+    );
+    proxy
+        .state
+        .finish_request(request_id, status.as_u16(), dur, started_at_ms + dur, None)
+        .await;
+    Err((status, "retry attempts exhausted".to_string()))
 }
 
 pub fn router(proxy: ProxyService) -> Router {

@@ -433,6 +433,9 @@ fn init_tracing(cli: &Cli) -> Option<WorkerGuard> {
     if interactive_tui {
         let log_dir = crate::config::proxy_home_dir().join("logs");
         let _ = std::fs::create_dir_all(&log_dir);
+
+        rotate_runtime_log_if_needed(&log_dir);
+
         let file_appender = tracing_appender::rolling::never(&log_dir, "runtime.log");
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
         tracing_subscriber::fmt()
@@ -447,8 +450,94 @@ fn init_tracing(cli: &Cli) -> Option<WorkerGuard> {
     }
 }
 
+fn rotate_runtime_log_if_needed(log_dir: &std::path::Path) {
+    fn parse_u64_env(key: &str) -> Option<u64> {
+        std::env::var(key)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+    }
+
+    fn parse_usize_env(key: &str) -> Option<usize> {
+        std::env::var(key)
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    }
+
+    let max_bytes = parse_u64_env("CODEX_HELPER_RUNTIME_LOG_MAX_BYTES").unwrap_or(20 * 1024 * 1024);
+    let max_files = parse_usize_env("CODEX_HELPER_RUNTIME_LOG_MAX_FILES").unwrap_or(10);
+    if max_bytes == 0 || max_files == 0 {
+        return;
+    }
+
+    let path = log_dir.join("runtime.log");
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return;
+    };
+    if meta.len() < max_bytes {
+        return;
+    }
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let rotated_path = log_dir.join(format!("runtime.log.{ts}"));
+    let _ = std::fs::rename(&path, &rotated_path);
+
+    let Ok(rd) = std::fs::read_dir(log_dir) else {
+        return;
+    };
+    let mut rotated: Vec<std::path::PathBuf> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.starts_with("runtime.log.") && s != "runtime.log")
+                .unwrap_or(false)
+        })
+        .collect();
+    if rotated.len() <= max_files {
+        return;
+    }
+    rotated.sort();
+    let remove_count = rotated.len().saturating_sub(max_files);
+    for p in rotated.into_iter().take(remove_count) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 async fn run_server(service_name: &'static str, port: u16, enable_tui: bool) -> anyhow::Result<()> {
     let interactive = enable_tui && atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout);
+
+    struct AutoRestoreGuard {
+        service_name: &'static str,
+    }
+
+    impl Drop for AutoRestoreGuard {
+        fn drop(&mut self) {
+            // Always try to restore the upstream config on exit; if no backup exists, this is a no-op.
+            if self.service_name == "claude" {
+                match codex_integration::claude_switch_off() {
+                    Ok(()) => tracing::info!("Claude settings restored from backup"),
+                    Err(err) => {
+                        tracing::warn!("Failed to restore Claude settings from backup: {}", err)
+                    }
+                }
+            } else if self.service_name == "codex" {
+                match codex_integration::switch_off() {
+                    Ok(()) => tracing::info!("Codex config restored from backup"),
+                    Err(err) => {
+                        tracing::warn!("Failed to restore Codex config from backup: {}", err)
+                    }
+                }
+            }
+        }
+    }
+
+    let _restore_guard = AutoRestoreGuard { service_name };
 
     // In Codex mode, automatically switch Codex to the local proxy; in Claude mode, try updating
     // settings.json as well (experimental).
@@ -595,19 +684,6 @@ async fn run_server(service_name: &'static str, port: u16, enable_tui: bool) -> 
             .await?;
         Ok(())
     };
-
-    // Always try to restore the upstream config on exit; if no backup exists, this is a no-op.
-    if service_name == "claude" {
-        match codex_integration::claude_switch_off() {
-            Ok(()) => tracing::info!("Claude settings restored from backup"),
-            Err(err) => tracing::warn!("Failed to restore Claude settings from backup: {}", err),
-        }
-    } else {
-        match codex_integration::switch_off() {
-            Ok(()) => tracing::info!("Codex config restored from backup"),
-            Err(err) => tracing::warn!("Failed to restore Codex config from backup: {}", err),
-        }
-    }
 
     result?;
 
@@ -850,12 +926,20 @@ async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
-        let mut sigterm =
-            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-        tokio::select! {
-            _ = sigint.recv() => {},
-            _ = sigterm.recv() => {},
+        match (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+        ) {
+            (Ok(mut sigint), Ok(mut sigterm)) => {
+                tokio::select! {
+                    _ = sigint.recv() => {},
+                    _ = sigterm.recv() => {},
+                }
+            }
+            _ => {
+                // Fallback: at least handle Ctrl+C.
+                let _ = tokio::signal::ctrl_c().await;
+            }
         }
     }
     #[cfg(not(unix))]

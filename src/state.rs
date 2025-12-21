@@ -7,8 +7,9 @@ use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
 
 use crate::sessions;
+use crate::usage::UsageMetrics;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ActiveRequest {
     pub id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16,14 +17,22 @@ pub struct ActiveRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_base_url: Option<String>,
     pub service: String,
     pub method: String,
     pub path: String,
     pub started_at_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct FinishedRequest {
     pub id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -31,13 +40,47 @@ pub struct FinishedRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageMetrics>,
     pub service: String,
     pub method: String,
     pub path: String,
     pub status_code: u16,
     pub duration_ms: u64,
     pub ended_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+pub struct SessionStats {
+    pub turns_total: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_config_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_usage: Option<UsageMetrics>,
+    pub total_usage: UsageMetrics,
+    pub turns_with_usage: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_ended_at_ms: Option<u64>,
+    pub last_seen_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +91,12 @@ struct SessionEffortOverride {
     last_seen_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+struct SessionCwdCacheEntry {
+    cwd: Option<String>,
+    last_seen_ms: u64,
+}
+
 /// Runtime-only state for the proxy process.
 ///
 /// This state is intentionally not persisted across restarts.
@@ -55,8 +104,11 @@ struct SessionEffortOverride {
 pub struct ProxyState {
     next_request_id: AtomicU64,
     session_override_ttl_ms: u64,
+    session_cwd_cache_ttl_ms: u64,
+    session_cwd_cache_max_entries: usize,
     session_effort_overrides: RwLock<HashMap<String, SessionEffortOverride>>,
-    session_cwd_cache: RwLock<HashMap<String, Option<String>>>,
+    session_cwd_cache: RwLock<HashMap<String, SessionCwdCacheEntry>>,
+    session_stats: RwLock<HashMap<String, SessionStats>>,
     active_requests: RwLock<HashMap<u64, ActiveRequest>>,
     recent_finished: RwLock<VecDeque<FinishedRequest>>,
 }
@@ -70,11 +122,24 @@ impl ProxyState {
             .unwrap_or(30 * 60);
         let ttl_ms = ttl_secs.saturating_mul(1000);
 
+        let cwd_cache_ttl_secs = std::env::var("CODEX_HELPER_SESSION_CWD_CACHE_TTL_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(12 * 60 * 60);
+        let cwd_cache_ttl_ms = cwd_cache_ttl_secs.saturating_mul(1000);
+        let cwd_cache_max_entries = std::env::var("CODEX_HELPER_SESSION_CWD_CACHE_MAX_ENTRIES")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(2_000);
+
         Arc::new(Self {
             next_request_id: AtomicU64::new(1),
             session_override_ttl_ms: ttl_ms,
+            session_cwd_cache_ttl_ms: cwd_cache_ttl_ms,
+            session_cwd_cache_max_entries: cwd_cache_max_entries,
             session_effort_overrides: RwLock::new(HashMap::new()),
             session_cwd_cache: RwLock::new(HashMap::new()),
+            session_stats: RwLock::new(HashMap::new()),
             active_requests: RwLock::new(HashMap::new()),
             recent_finished: RwLock::new(VecDeque::new()),
         })
@@ -123,12 +188,32 @@ impl ProxyState {
     }
 
     pub async fn resolve_session_cwd(&self, session_id: &str) -> Option<String> {
+        if self.session_cwd_cache_max_entries == 0 {
+            return sessions::find_codex_session_cwd_by_id(session_id)
+                .await
+                .ok()
+                .flatten();
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
         {
             let guard = self.session_cwd_cache.read().await;
             if let Some(v) = guard.get(session_id) {
-                return v.clone();
+                let out = v.cwd.clone();
+                drop(guard);
+                let mut guard = self.session_cwd_cache.write().await;
+                if let Some(v) = guard.get_mut(session_id) {
+                    v.last_seen_ms = now_ms;
+                }
+                return out;
             }
         }
+
+        // Cache miss: resolve from disk and record last_seen.
 
         let resolved = sessions::find_codex_session_cwd_by_id(session_id)
             .await
@@ -136,7 +221,13 @@ impl ProxyState {
             .flatten();
 
         let mut guard = self.session_cwd_cache.write().await;
-        guard.insert(session_id.to_string(), resolved.clone());
+        guard.insert(
+            session_id.to_string(),
+            SessionCwdCacheEntry {
+                cwd: resolved.clone(),
+                last_seen_ms: now_ms,
+            },
+        );
         resolved
     }
 
@@ -148,6 +239,7 @@ impl ProxyState {
         path: &str,
         session_id: Option<String>,
         cwd: Option<String>,
+        model: Option<String>,
         reasoning_effort: Option<String>,
         started_at_ms: u64,
     ) -> u64 {
@@ -156,7 +248,11 @@ impl ProxyState {
             id,
             session_id,
             cwd,
+            model,
             reasoning_effort,
+            config_name: None,
+            provider_id: None,
+            upstream_base_url: None,
             service: service.to_string(),
             method: method.to_string(),
             path: path.to_string(),
@@ -167,12 +263,29 @@ impl ProxyState {
         id
     }
 
+    pub async fn update_request_route(
+        &self,
+        request_id: u64,
+        config_name: String,
+        provider_id: Option<String>,
+        upstream_base_url: String,
+    ) {
+        let mut guard = self.active_requests.write().await;
+        let Some(req) = guard.get_mut(&request_id) else {
+            return;
+        };
+        req.config_name = Some(config_name);
+        req.provider_id = provider_id;
+        req.upstream_base_url = Some(upstream_base_url);
+    }
+
     pub async fn finish_request(
         &self,
         id: u64,
         status_code: u16,
         duration_ms: u64,
         ended_at_ms: u64,
+        usage: Option<UsageMetrics>,
     ) {
         let mut active = self.active_requests.write().await;
         let Some(req) = active.remove(&id) else {
@@ -183,7 +296,12 @@ impl ProxyState {
             id,
             session_id: req.session_id,
             cwd: req.cwd,
+            model: req.model,
             reasoning_effort: req.reasoning_effort,
+            config_name: req.config_name,
+            provider_id: req.provider_id,
+            upstream_base_url: req.upstream_base_url,
+            usage: usage.clone(),
             service: req.service,
             method: req.method,
             path: req.path,
@@ -191,6 +309,34 @@ impl ProxyState {
             duration_ms,
             ended_at_ms,
         };
+
+        if let Some(sid) = finished.session_id.as_deref() {
+            let mut stats = self.session_stats.write().await;
+            let entry = stats.entry(sid.to_string()).or_default();
+            entry.turns_total = entry.turns_total.saturating_add(1);
+            entry.last_model = finished.model.clone().or(entry.last_model.clone());
+            entry.last_reasoning_effort = finished
+                .reasoning_effort
+                .clone()
+                .or(entry.last_reasoning_effort.clone());
+            entry.last_provider_id = finished
+                .provider_id
+                .clone()
+                .or(entry.last_provider_id.clone());
+            entry.last_config_name = finished
+                .config_name
+                .clone()
+                .or(entry.last_config_name.clone());
+            if let Some(u) = usage.as_ref() {
+                entry.last_usage = Some(u.clone());
+                entry.total_usage.add_assign(u);
+                entry.turns_with_usage = entry.turns_with_usage.saturating_add(1);
+            }
+            entry.last_status = Some(status_code);
+            entry.last_duration_ms = Some(duration_ms);
+            entry.last_ended_at_ms = Some(ended_at_ms);
+            entry.last_seen_ms = ended_at_ms;
+        }
 
         let mut recent = self.recent_finished.write().await;
         recent.push_front(finished);
@@ -211,29 +357,27 @@ impl ProxyState {
         guard.iter().take(limit).cloned().collect()
     }
 
+    pub async fn list_session_stats(&self) -> HashMap<String, SessionStats> {
+        let guard = self.session_stats.read().await;
+        guard.clone()
+    }
+
     pub fn spawn_cleanup_task(state: Arc<Self>) {
         // Run periodically; no need to be super frequent.
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(30));
             loop {
                 tick.tick().await;
-                state.prune_session_overrides().await;
+                state.prune_periodic().await;
             }
         });
     }
 
-    async fn prune_session_overrides(&self) {
-        if self.session_override_ttl_ms == 0 {
-            return;
-        }
+    async fn prune_periodic(&self) {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        if now_ms < self.session_override_ttl_ms {
-            return;
-        }
-        let cutoff = now_ms - self.session_override_ttl_ms;
 
         // Collect active session_ids to avoid clearing overrides for currently running requests.
         let active = self.active_requests.read().await;
@@ -244,12 +388,64 @@ impl ProxyState {
             }
         }
 
-        let mut overrides = self.session_effort_overrides.write().await;
-        overrides.retain(|sid, v| {
-            if active_sessions.contains_key(sid) {
-                return true;
-            }
-            v.last_seen_ms >= cutoff
-        });
+        if self.session_override_ttl_ms > 0 && now_ms >= self.session_override_ttl_ms {
+            let cutoff_override = now_ms - self.session_override_ttl_ms;
+            let mut overrides = self.session_effort_overrides.write().await;
+            overrides.retain(|sid, v| {
+                if active_sessions.contains_key(sid) {
+                    return true;
+                }
+                v.last_seen_ms >= cutoff_override
+            });
+        }
+
+        let cutoff_cwd =
+            if self.session_cwd_cache_ttl_ms == 0 || now_ms < self.session_cwd_cache_ttl_ms {
+                0
+            } else {
+                now_ms - self.session_cwd_cache_ttl_ms
+            };
+        self.prune_session_cwd_cache(&active_sessions, cutoff_cwd)
+            .await;
+
+        if self.session_override_ttl_ms > 0 && now_ms >= self.session_override_ttl_ms {
+            let cutoff_stats = now_ms - self.session_override_ttl_ms;
+            let mut stats = self.session_stats.write().await;
+            stats.retain(|sid, v| {
+                active_sessions.contains_key(sid) || v.last_seen_ms >= cutoff_stats
+            });
+        }
+    }
+
+    async fn prune_session_cwd_cache(&self, active_sessions: &HashMap<String, ()>, cutoff: u64) {
+        if self.session_cwd_cache_max_entries == 0 {
+            return;
+        }
+        let mut cache = self.session_cwd_cache.write().await;
+
+        if self.session_cwd_cache_ttl_ms > 0 {
+            cache.retain(|sid, v| {
+                if active_sessions.contains_key(sid) {
+                    return true;
+                }
+                v.last_seen_ms >= cutoff
+            });
+        }
+
+        let max = self.session_cwd_cache_max_entries;
+        if max == 0 || cache.len() <= max {
+            return;
+        }
+
+        // Drop least-recently-seen entries first.
+        let mut keys = cache
+            .iter()
+            .map(|(sid, v)| (sid.clone(), v.last_seen_ms))
+            .collect::<Vec<_>>();
+        keys.sort_by_key(|(_, t)| *t);
+        let remove_count = keys.len().saturating_sub(max);
+        for (sid, _) in keys.into_iter().take(remove_count) {
+            cache.remove(&sid);
+        }
     }
 }
