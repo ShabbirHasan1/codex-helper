@@ -1,6 +1,24 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2025-12-23
+### Added
+- `session list/search` now shows rounds/turn counts and `last_response_at` (and includes these fields in `session export`).
+- Session stats cache at `~/.codex-helper/cache/session_stats.json` to speed up `session list/search` (turn counts + timestamps).
+- Retry now honors `Retry-After: <seconds>` when present.
+- Codex bootstrap/import now imports all `model_providers.*` entries from `~/.codex/config.toml` as switchable configs (instead of only the active provider).
+- Runtime-only upstream config overrides: per-session and global (applies to new requests only; does not interrupt in-flight streaming).
+- TUI provider switch menu: `p` for session override, `P` for global override (with clear option).
+
+### Changed
+- Default retry status codes now include `429` (useful during high-demand throttling).
+- `session list/search` candidate ordering prefers session file `mtime` (better behavior for resumed sessions).
+- `rounds` is now computed as `min(user_turns, assistant_turns)` (best-effort).
+- HTTP request body previews are now gated by `CODEX_HELPER_HTTP_LOG_REQUEST_BODY=1` (default off).
+- Proxy hot path reduces copying/cloning: `Bytes` request bodies, lazy header-entry materialization, and zero-copy filtering when no active rules.
+- TUI sessions list: improved layout and keeps selection visible while scrolling.
+- Documentation refresh: remove untested Claude sections; highlight auto-retry and session-cache behavior.
+
 ## [0.3.0] - 2025-12-21
 ### Added
 - Upstream retry with LB-aware failover (avoid previously-failed upstreams in the same request, and apply cooldown penalties for Cloudflare-like failures).
@@ -50,4 +68,3 @@ All notable changes to this project will be documented in this file.
 - Hop-by-hop header filtering and safer response header forwarding for streaming/non-streaming responses.
 - Request body filter fallback for invalid regex rules (avoid corrupting payloads).
 - Session rollout filename UUID parsing, and deterministic `active_config()` fallback selection.
-

@@ -1,6 +1,6 @@
 [package]
 name = "codex-helper"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
@@ -42,6 +42,9 @@ regex = "1.12.2"
 atty = "0.2.14"
 owo-colors = "4.2.3"
 iocraft = "0.7.16"
+
+[dev-dependencies]
+pretty_assertions = "1.4.1"
 
 [package.metadata.binstall]
 # `cargo-binstall` provides `{ repo }` as a full URL (e.g. https://github.com/OWNER/REPO),

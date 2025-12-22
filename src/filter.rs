@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use axum::body::Bytes;
 use regex::bytes::Regex;
 use serde::Deserialize;
 
@@ -157,6 +158,7 @@ impl RequestFilter {
         out
     }
 
+    #[allow(dead_code)]
     pub fn apply(&self, data: &[u8]) -> Vec<u8> {
         if data.is_empty() {
             return Vec::new();
@@ -198,6 +200,52 @@ impl RequestFilter {
             }
         }
         buf
+    }
+
+    /// Apply filter rules to a `Bytes` payload.
+    ///
+    /// If there are no active rules, returns the original `Bytes` without copying.
+    pub fn apply_bytes(&self, data: Bytes) -> Bytes {
+        if data.is_empty() {
+            return data;
+        }
+
+        let mut inner = match self.inner.lock() {
+            Ok(i) => i,
+            Err(_) => return data,
+        };
+
+        self.reload_if_needed(&mut inner);
+        if inner.rules.is_empty() {
+            return data;
+        }
+
+        let mut buf = data.to_vec();
+        for rule in &inner.rules {
+            match rule.op {
+                FilterOp::Replace => {
+                    if let Some(re) = &rule.regex {
+                        buf = re
+                            .replace_all(&buf, rule.target_bytes.as_slice())
+                            .into_owned();
+                    } else {
+                        buf = Self::replace_all_bytes(
+                            &buf,
+                            rule.source_bytes.as_slice(),
+                            rule.target_bytes.as_slice(),
+                        );
+                    }
+                }
+                FilterOp::Remove => {
+                    if let Some(re) = &rule.regex {
+                        buf = re.replace_all(&buf, &[][..]).into_owned();
+                    } else {
+                        buf = Self::replace_all_bytes(&buf, rule.source_bytes.as_slice(), &[][..]);
+                    }
+                }
+            }
+        }
+        Bytes::from(buf)
     }
 }
 

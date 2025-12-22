@@ -18,7 +18,8 @@ pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
             } else {
                 println!("Recent Codex sessions (newest first):");
                 for s in sessions {
-                    let updated = s.updated_at.as_deref().unwrap_or("-");
+                    let last_update = s.updated_at.as_deref().unwrap_or("-");
+                    let last_response = s.last_response_at.as_deref().unwrap_or("-");
                     let cwd = s.cwd.as_deref().unwrap_or("-");
                     let preview_raw = s
                         .first_user_message
@@ -28,7 +29,10 @@ pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
                     let preview = super::doctor::truncate_for_display(&preview_raw, 80);
 
                     println!("- id: {}", s.id);
-                    println!("  updated: {} | cwd: {}", updated, cwd);
+                    println!(
+                        "  rounds: {} (user/assistant: {}/{}) | last_response: {} | last_update: {} | cwd: {}",
+                        s.rounds, s.user_turns, s.assistant_turns, last_response, last_update, cwd
+                    );
                     if !preview.is_empty() {
                         println!("  prompt: {}", preview);
                     }
@@ -46,7 +50,15 @@ pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
             if let Some(s) = sessions.pop() {
                 println!("Last Codex session for current project:");
                 println!("  id: {}", s.id);
-                println!("  updated_at: {}", s.updated_at.as_deref().unwrap_or("-"));
+                println!("  rounds: {}", s.rounds);
+                println!(
+                    "  last_response_at: {}",
+                    s.last_response_at.as_deref().unwrap_or("-")
+                );
+                println!(
+                    "  last_update_at: {}",
+                    s.updated_at.as_deref().unwrap_or("-")
+                );
                 println!("  cwd: {}", s.cwd.as_deref().unwrap_or("-"));
                 if let Some(msg) = s.first_user_message.as_deref() {
                     let msg_single = msg.replace('\n', " ");
@@ -74,7 +86,8 @@ pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
             } else {
                 println!("Sessions matching '{}':", query);
                 for s in sessions {
-                    let updated = s.updated_at.as_deref().unwrap_or("-");
+                    let last_update = s.updated_at.as_deref().unwrap_or("-");
+                    let last_response = s.last_response_at.as_deref().unwrap_or("-");
                     let cwd = s.cwd.as_deref().unwrap_or("-");
                     let preview_raw = s
                         .first_user_message
@@ -84,7 +97,10 @@ pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
                     let preview = super::doctor::truncate_for_display(&preview_raw, 80);
 
                     println!("- id: {}", s.id);
-                    println!("  updated: {} | cwd: {}", updated, cwd);
+                    println!(
+                        "  rounds: {} (user/assistant: {}/{}) | last_response: {} | last_update: {} | cwd: {}",
+                        s.rounds, s.user_turns, s.assistant_turns, last_response, last_update, cwd
+                    );
                     if !preview.is_empty() {
                         println!("  prompt: {}", preview);
                     }
@@ -111,6 +127,10 @@ pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
                     "cwd": sess.cwd,
                     "created_at": sess.created_at,
                     "updated_at": sess.updated_at,
+                    "last_response_at": sess.last_response_at,
+                    "user_turns": sess.user_turns,
+                    "assistant_turns": sess.assistant_turns,
+                    "rounds": sess.rounds,
                     "first_user_message": sess.first_user_message,
                     "path": sess.path,
                 });
@@ -123,6 +143,10 @@ pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
                 if let Some(updated) = sess.updated_at.as_deref() {
                     md.push_str(&format!("- updated_at: `{}`\n", updated));
                 }
+                if let Some(updated) = sess.last_response_at.as_deref() {
+                    md.push_str(&format!("- last_response_at: `{}`\n", updated));
+                }
+                md.push_str(&format!("- rounds: `{}`\n", sess.rounds));
                 if let Some(cwd) = sess.cwd.as_deref() {
                     md.push_str(&format!("- cwd: `{}`\n", cwd));
                 }

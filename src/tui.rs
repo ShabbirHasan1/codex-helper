@@ -11,6 +11,8 @@ use crate::usage::UsageMetrics;
 enum UiMode {
     Normal,
     EffortMenu,
+    ProviderMenuSession,
+    ProviderMenuGlobal,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -24,6 +26,8 @@ struct Theme {
     muted: Color,
     focus: Color,
 }
+
+const SESSION_ROW_HEIGHT: i32 = 2;
 
 impl Default for Theme {
     fn default() -> Self {
@@ -97,6 +101,7 @@ struct SessionRow {
     turns_total: Option<u64>,
     turns_with_usage: Option<u64>,
     override_effort: Option<String>,
+    override_config_name: Option<String>,
 }
 
 fn now_ms() -> u64 {
@@ -180,6 +185,7 @@ fn build_session_rows(
     active: Vec<ActiveRequest>,
     recent: &[FinishedRequest],
     overrides: &std::collections::HashMap<String, String>,
+    config_overrides: &std::collections::HashMap<String, String>,
     stats: &std::collections::HashMap<String, SessionStats>,
 ) -> Vec<SessionRow> {
     use std::collections::HashMap;
@@ -207,6 +213,7 @@ fn build_session_rows(
             turns_total: None,
             turns_with_usage: None,
             override_effort: None,
+            override_config_name: None,
         });
 
         entry.active_count += 1;
@@ -256,6 +263,7 @@ fn build_session_rows(
             turns_total: None,
             turns_with_usage: None,
             override_effort: None,
+            override_config_name: None,
         });
 
         let should_update = entry
@@ -308,6 +316,7 @@ fn build_session_rows(
             turns_total: None,
             turns_with_usage: Some(st.turns_with_usage),
             override_effort: None,
+            override_config_name: None,
         });
         entry.turns_total = Some(st.turns_total);
         if entry.last_model.is_none() {
@@ -354,13 +363,46 @@ fn build_session_rows(
             turns_total: None,
             turns_with_usage: None,
             override_effort: None,
+            override_config_name: None,
         });
         entry.override_effort = Some(eff.clone());
+    }
+
+    for (sid, cfg_name) in config_overrides.iter() {
+        let key = Some(sid.clone());
+        let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
+            session_id: key,
+            cwd: None,
+            active_count: 0,
+            active_started_at_ms_min: None,
+            active_last_method: None,
+            active_last_path: None,
+            last_status: None,
+            last_duration_ms: None,
+            last_ended_at_ms: None,
+            last_model: None,
+            last_reasoning_effort: None,
+            last_provider_id: None,
+            last_config_name: None,
+            last_usage: None,
+            total_usage: None,
+            turns_total: None,
+            turns_with_usage: None,
+            override_effort: None,
+            override_config_name: None,
+        });
+        entry.override_config_name = Some(cfg_name.clone());
     }
 
     let mut rows = map.into_values().collect::<Vec<_>>();
     rows.sort_by_key(|r| std::cmp::Reverse(session_sort_key(r)));
     rows
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProviderOption {
+    pub name: String,
+    pub alias: Option<String>,
 }
 
 #[derive(Default, Props)]
@@ -370,6 +412,7 @@ struct AppProps {
     port: Option<u16>,
     shutdown: Option<watch::Sender<bool>>,
     shutdown_rx: Option<watch::Receiver<bool>>,
+    providers: Option<Vec<ProviderOption>>,
 }
 
 #[component]
@@ -394,13 +437,16 @@ fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
 
     let mut selected_session_idx = hooks.use_state(|| 0usize);
     let mut selected_recent_idx = hooks.use_state(|| 0usize);
-    let list_scroll = hooks.use_state(|| 0i32);
+    let mut list_scroll = hooks.use_state(|| 0i32);
 
     let effort_menu_idx = hooks.use_state(|| 0usize);
+    let provider_menu_idx = hooks.use_state(|| 0usize);
 
     let rows = hooks.use_state(Vec::<SessionRow>::new);
     let recent = hooks.use_state(Vec::<FinishedRequest>::new);
     let overrides = hooks.use_state(std::collections::HashMap::<String, String>::new);
+    let config_overrides = hooks.use_state(std::collections::HashMap::<String, String>::new);
+    let global_config_override = hooks.use_state(|| None::<String>);
     let stats = hooks.use_state(std::collections::HashMap::<String, SessionStats>::new);
 
     let refresh_ms = std::env::var("CODEX_HELPER_TUI_REFRESH_MS")
@@ -415,6 +461,8 @@ fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         let mut rows = rows;
         let mut recent_state = recent;
         let mut overrides_state = overrides;
+        let mut config_overrides_state = config_overrides;
+        let mut global_override_state = global_config_override;
         let mut stats_state = stats;
         hooks.use_future(async move {
             loop {
@@ -422,8 +470,16 @@ fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 let active = state.list_active_requests().await;
                 let recent_vec = state.list_recent_finished(200).await;
                 let overrides_map = state.list_session_effort_overrides().await;
+                let config_overrides_map = state.list_session_config_overrides().await;
+                let global_override = state.get_global_config_override().await;
                 let stats_map = state.list_session_stats().await;
-                let next_rows = build_session_rows(active, &recent_vec, &overrides_map, &stats_map);
+                let next_rows = build_session_rows(
+                    active,
+                    &recent_vec,
+                    &overrides_map,
+                    &config_overrides_map,
+                    &stats_map,
+                );
 
                 let rows_changed = { *rows.read() != next_rows };
                 if rows_changed {
@@ -436,6 +492,15 @@ fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 let overrides_changed = { *overrides_state.read() != overrides_map };
                 if overrides_changed {
                     overrides_state.set(overrides_map);
+                }
+                let cfg_overrides_changed =
+                    { *config_overrides_state.read() != config_overrides_map };
+                if cfg_overrides_changed {
+                    config_overrides_state.set(config_overrides_map);
+                }
+                let global_changed = { *global_override_state.read() != global_override };
+                if global_changed {
+                    global_override_state.set(global_override);
                 }
                 let stats_changed = { *stats_state.read() != stats_map };
                 if stats_changed {
@@ -472,6 +537,37 @@ fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         }
     });
 
+    let apply_provider_override = hooks.use_async_handler({
+        let state = state.clone();
+        move |(session_id, config_name): (String, Option<String>)| {
+            let state = state.clone();
+            async move {
+                let now = now_ms();
+                if let Some(cfg) = config_name {
+                    state
+                        .set_session_config_override(session_id, cfg, now)
+                        .await;
+                } else {
+                    state.clear_session_config_override(&session_id).await;
+                }
+            }
+        }
+    });
+
+    let apply_global_provider_override = hooks.use_async_handler({
+        let state = state.clone();
+        move |config_name: Option<String>| {
+            let state = state.clone();
+            async move {
+                if let Some(cfg) = config_name {
+                    state.set_global_config_override(cfg).await;
+                } else {
+                    state.clear_global_config_override().await;
+                }
+            }
+        }
+    });
+
     let request_shutdown = hooks.use_async_handler({
         let shutdown = shutdown_tx.clone();
         move |_| {
@@ -485,7 +581,11 @@ fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let rows_vec = rows.read().clone();
     let recent_vec = recent.read().clone();
     let overrides_map = overrides.read().clone();
+    let config_overrides_map = config_overrides.read().clone();
+    let global_override = global_config_override.read().clone();
     let stats_map = stats.read().clone();
+    let providers = props.providers.clone().unwrap_or_default();
+    let providers_for_events = providers.clone();
 
     let selected_session_idx_clamped = if rows_vec.is_empty() {
         0
@@ -506,11 +606,15 @@ fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         let mut selected_recent_state = selected_recent_idx;
         let mut list_scroll = list_scroll;
         let mut effort_menu_idx = effort_menu_idx;
+        let mut provider_menu_idx = provider_menu_idx;
+        let providers = providers_for_events;
 
         move |event| match event {
             TerminalEvent::Key(KeyEvent { code, kind, .. }) if kind != KeyEventKind::Release => {
                 let rows_vec = rows.read();
                 let recent_vec = recent.read();
+                let cfg_overrides = config_overrides.read();
+                let global_override = global_config_override.read();
 
                 let has_session = !rows_vec.is_empty();
                 let cur_session_idx = if has_session {
@@ -621,6 +725,35 @@ fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                                 apply_effort((sid, None));
                             }
                         }
+                        KeyCode::Char('p') => {
+                            if focus.get() != Focus::Sessions {
+                                return;
+                            }
+                            let Some(sid) = rows_vec
+                                .get(cur_session_idx)
+                                .and_then(|r| r.session_id.clone())
+                            else {
+                                return;
+                            };
+                            mode.set(UiMode::ProviderMenuSession);
+                            let current = cfg_overrides.get(&sid).map(|s| s.as_str()).unwrap_or("");
+                            let idx = providers
+                                .iter()
+                                .position(|p| p.name == current)
+                                .map(|i| i + 1)
+                                .unwrap_or(0);
+                            provider_menu_idx.set(idx);
+                        }
+                        KeyCode::Char('P') => {
+                            mode.set(UiMode::ProviderMenuGlobal);
+                            let current = global_override.as_deref().unwrap_or("");
+                            let idx = providers
+                                .iter()
+                                .position(|p| p.name == current)
+                                .map(|i| i + 1)
+                                .unwrap_or(0);
+                            provider_menu_idx.set(idx);
+                        }
                         _ => {}
                     },
                     UiMode::EffortMenu => match code {
@@ -651,6 +784,42 @@ fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         }
                         _ => {}
                     },
+                    UiMode::ProviderMenuSession | UiMode::ProviderMenuGlobal => match code {
+                        KeyCode::Esc => mode.set(UiMode::Normal),
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            provider_menu_idx.set(provider_menu_idx.get().saturating_sub(1));
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let max = providers.len();
+                            provider_menu_idx.set((provider_menu_idx.get() + 1).min(max));
+                        }
+                        KeyCode::Enter => {
+                            let idx = provider_menu_idx.get();
+                            let chosen = if idx == 0 {
+                                None
+                            } else {
+                                providers.get(idx - 1).map(|p| p.name.clone())
+                            };
+                            match mode.get() {
+                                UiMode::ProviderMenuGlobal => {
+                                    apply_global_provider_override(chosen);
+                                }
+                                UiMode::ProviderMenuSession => {
+                                    let Some(sid) = rows_vec
+                                        .get(cur_session_idx)
+                                        .and_then(|r| r.session_id.clone())
+                                    else {
+                                        mode.set(UiMode::Normal);
+                                        return;
+                                    };
+                                    apply_provider_override((sid, chosen));
+                                }
+                                _ => {}
+                            }
+                            mode.set(UiMode::Normal);
+                        }
+                        _ => {}
+                    },
                 }
             }
             _ => {}
@@ -664,9 +833,13 @@ fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
 
     let (width, height) = hooks.use_terminal_size();
     let theme = Theme::default();
+    let global_override_label = global_override
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("-");
     let title = format!(
-        "codex-helper | {}:{} | Tab 切换焦点 | Enter effort 菜单 | l/m/h/X 快速设置 | x 清除 | q 退出",
-        service_name, port
+        "codex-helper | {}:{} | cfg(global): {} | Tab 焦点 | Enter effort | p 会话cfg | P 全局cfg | l/m/h/X effort | x 清effort | q 退出",
+        service_name, port, global_override_label
     );
 
     let selected_row = rows_vec.get(selected_session_idx_clamped);
@@ -680,6 +853,9 @@ fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
 
     let selected_override = selected_row
         .and_then(|r| r.override_effort.as_deref())
+        .unwrap_or("-");
+    let selected_cfg_override = selected_row
+        .and_then(|r| r.override_config_name.as_deref())
         .unwrap_or("-");
     let selected_effort = selected_row
         .and_then(|r| r.override_effort.as_deref())
@@ -724,7 +900,9 @@ fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         })
         .unwrap_or_else(|| "tok sum in/out/rsn/ttl: -".to_string());
 
-    let menu_open = mode.get() == UiMode::EffortMenu;
+    let effort_menu_open = mode.get() == UiMode::EffortMenu;
+    let provider_menu_open =
+        mode.get() == UiMode::ProviderMenuSession || mode.get() == UiMode::ProviderMenuGlobal;
 
     let mut recent_for_selected: Vec<FinishedRequest> = Vec::new();
     if let Some(sid) = selected_row.and_then(|r| r.session_id.as_deref()) {
@@ -799,13 +977,43 @@ fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         .map(|(sid, eff)| {
             element! {
                 Text(
-                    content: format!("  {} => {}", shorten(sid, 24), eff),
+                    content: format!("  eff {} => {}", shorten(sid, 24), eff),
                     color: theme.muted
                 )
             }
             .into()
         })
         .collect();
+
+    let cfg_overrides_children: Vec<AnyElement<'static>> = config_overrides_map
+        .iter()
+        .take(8)
+        .map(|(sid, cfg_name)| {
+            element! {
+                Text(
+                    content: format!("  cfg {} => {}", shorten(sid, 24), cfg_name),
+                    color: theme.muted
+                )
+            }
+            .into()
+        })
+        .collect();
+
+    // Keep selection visible in the sessions list (best-effort; iocraft doesn't expose exact pane height).
+    {
+        let visible_rows = ((height as i32).saturating_sub(10) / SESSION_ROW_HEIGHT).max(1);
+        let max_scroll = (rows_vec.len() as i32).saturating_sub(visible_rows).max(0);
+        let mut scroll = list_scroll.get().max(0).min(max_scroll);
+        let sel = selected_session_idx_clamped as i32;
+        if sel < scroll {
+            scroll = sel;
+        } else if sel >= scroll + visible_rows {
+            scroll = (sel - visible_rows + 1).max(0);
+        }
+        if scroll != list_scroll.get() {
+            list_scroll.set(scroll);
+        }
+    }
 
     element! {
         View(
@@ -840,7 +1048,7 @@ fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                     View(padding_left: 1, padding_right: 1, padding_top: 1, padding_bottom: 1) {
                         Text(
                             content: format!(
-                                "Sessions ({}){}",
+                                "Sessions ({}){}  act=活跃请求数 st=状态 eff=reasoning.effort",
                                 rows_vec.len(),
                                 if focus.get() == Focus::Sessions { " [focus]" } else { "" }
                             ),
@@ -861,7 +1069,7 @@ fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                     ) {
                         View(
                             position: Position::Absolute,
-                            top: -list_scroll.get(),
+                            top: -(list_scroll.get() * SESSION_ROW_HEIGHT),
                             flex_direction: FlexDirection::Column,
                         ) {
                             #(rows_vec.iter().enumerate().map(|(idx, row)| {
@@ -887,68 +1095,72 @@ fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                                         background_color: bg,
                                         padding_left: 1,
                                         padding_right: 1,
-                                        flex_direction: FlexDirection::Row,
+                                        flex_direction: FlexDirection::Column,
                                     ) {
-                                        Text(
-                                            content: format!("{:>3} ", idx),
-                                            wrap: TextWrap::NoWrap,
-                                            color: if selected { theme.text } else { theme.muted },
-                                            weight: if selected { Weight::Bold } else { Weight::Normal },
-                                        )
-                                        Text(
-                                            content: format!("{:<10} ", shorten(cwd, 10)),
-                                            wrap: TextWrap::NoWrap,
-                                            color: if selected { theme.text } else { theme.text },
-                                            weight: if selected { Weight::Bold } else { Weight::Normal },
-                                        )
-                                        Text(
-                                            content: format!("{:<12} ", sid),
-                                            wrap: TextWrap::NoWrap,
-                                            color: if selected { theme.text } else { theme.text },
-                                            weight: if selected { Weight::Bold } else { Weight::Normal },
-                                        )
-                                        Text(
-                                            content: format!("n={:<2} ", active_n),
-                                            wrap: TextWrap::NoWrap,
-                                            color: if selected { theme.text } else { active_color },
-                                            weight: if selected { Weight::Bold } else { Weight::Normal },
-                                        )
-                                        Text(
-                                            content: format!("st={:<3} ", last_status),
-                                            wrap: TextWrap::NoWrap,
-                                            color: if selected { theme.text } else { st_color },
-                                            weight: if selected { Weight::Bold } else { Weight::Normal },
-                                        )
-                                        Text(
-                                            content: format!("mdl={:<10} ", model),
-                                            wrap: TextWrap::NoWrap,
-                                            color: if selected { theme.text } else { theme.muted },
-                                            weight: if selected { Weight::Bold } else { Weight::Normal },
-                                        )
-                                        Text(
-                                            content: format!("t={:<4} ", turns),
-                                            wrap: TextWrap::NoWrap,
-                                            color: if selected { theme.text } else { theme.muted },
-                                            weight: if selected { Weight::Bold } else { Weight::Normal },
-                                        )
-                                        Text(
-                                            content: format!("pv={:<8} ", provider),
-                                            wrap: TextWrap::NoWrap,
-                                            color: if selected { theme.text } else { theme.muted },
-                                            weight: if selected { Weight::Bold } else { Weight::Normal },
-                                        )
-                                        Text(
-                                            content: format!("tok={} ", tok_sum),
-                                            wrap: TextWrap::NoWrap,
-                                            color: if selected { theme.text } else { theme.muted },
-                                            weight: if selected { Weight::Bold } else { Weight::Normal },
-                                        )
-                                        Text(
-                                            content: format!("eff={}", shorten(effort, 6)),
-                                            wrap: TextWrap::NoWrap,
-                                            color: if selected { theme.text } else { theme.muted },
-                                            weight: if selected { Weight::Bold } else { Weight::Normal },
-                                        )
+                                        View(flex_direction: FlexDirection::Row) {
+                                            Text(
+                                                content: format!("{:>3} ", idx),
+                                                wrap: TextWrap::NoWrap,
+                                                color: if selected { theme.text } else { theme.muted },
+                                                weight: if selected { Weight::Bold } else { Weight::Normal },
+                                            )
+                                            Text(
+                                                content: format!("{:<12} ", shorten(cwd, 12)),
+                                                wrap: TextWrap::NoWrap,
+                                                color: if selected { theme.text } else { theme.text },
+                                                weight: if selected { Weight::Bold } else { Weight::Normal },
+                                            )
+                                            Text(
+                                                content: format!("{:<14} ", sid),
+                                                wrap: TextWrap::NoWrap,
+                                                color: if selected { theme.text } else { theme.text },
+                                                weight: if selected { Weight::Bold } else { Weight::Normal },
+                                            )
+                                            Text(
+                                                content: format!("act={:<2} ", active_n),
+                                                wrap: TextWrap::NoWrap,
+                                                color: if selected { theme.text } else { active_color },
+                                                weight: if selected { Weight::Bold } else { Weight::Normal },
+                                            )
+                                            Text(
+                                                content: format!("st={:<3} ", last_status),
+                                                wrap: TextWrap::NoWrap,
+                                                color: if selected { theme.text } else { st_color },
+                                                weight: if selected { Weight::Bold } else { Weight::Normal },
+                                            )
+                                            Text(
+                                                content: format!("eff={}", shorten(effort, 6)),
+                                                wrap: TextWrap::NoWrap,
+                                                color: if selected { theme.text } else { theme.muted },
+                                                weight: if selected { Weight::Bold } else { Weight::Normal },
+                                            )
+                                        }
+                                        View(flex_direction: FlexDirection::Row) {
+                                            Text(
+                                                content: format!("     mdl={:<12} ", model),
+                                                wrap: TextWrap::NoWrap,
+                                                color: if selected { theme.text } else { theme.muted },
+                                                weight: if selected { Weight::Bold } else { Weight::Normal },
+                                            )
+                                            Text(
+                                                content: format!("pv={:<8} ", provider),
+                                                wrap: TextWrap::NoWrap,
+                                                color: if selected { theme.text } else { theme.muted },
+                                                weight: if selected { Weight::Bold } else { Weight::Normal },
+                                            )
+                                            Text(
+                                                content: format!("t={:<4} ", turns),
+                                                wrap: TextWrap::NoWrap,
+                                                color: if selected { theme.text } else { theme.muted },
+                                                weight: if selected { Weight::Bold } else { Weight::Normal },
+                                            )
+                                            Text(
+                                                content: format!("tok={}", tok_sum),
+                                                wrap: TextWrap::NoWrap,
+                                                color: if selected { theme.text } else { theme.muted },
+                                                weight: if selected { Weight::Bold } else { Weight::Normal },
+                                            )
+                                        }
                                     }
                                 }
                             }))
@@ -978,7 +1190,9 @@ fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         Text(content: "Selected session", weight: Weight::Bold, color: theme.text)
                         Text(content: format!("sid: {}", selected_sid), color: theme.muted)
                         Text(content: format!("cwd: {}", selected_cwd), color: theme.muted)
-                        Text(content: format!("effort: {}  (override: {})", selected_effort, selected_override), color: theme.muted)
+                        Text(content: format!("effort: {}", selected_effort), color: theme.muted)
+                        Text(content: format!("override: {}", selected_override), color: theme.muted)
+                        Text(content: format!("cfg override: {}  (global: {})", selected_cfg_override, global_override_label), color: theme.muted)
                         Text(content: format!("model: {}", selected_model), color: theme.muted)
                         Text(content: format!("provider: {}  (config: {})", selected_provider, selected_config), color: theme.muted)
                         Text(content: format!("turns: {}", selected_turns_total), color: theme.muted)
@@ -1024,17 +1238,22 @@ fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         flex_direction: FlexDirection::Column,
                     ) {
                         Text(
-                            content: format!("Session overrides ({})", overrides_map.len()),
+                            content: format!(
+                                "Session overrides (eff={}, cfg={})",
+                                overrides_map.len(),
+                                config_overrides_map.len()
+                            ),
                             weight: Weight::Bold,
                             color: theme.text,
                         )
                         #(overrides_children)
+                        #(cfg_overrides_children)
                     }
                 }
 
                 // Modal: effort menu
                 #(
-                    menu_open.then(|| element! {
+                    effort_menu_open.then(|| element! {
                         View(
                             position: Position::Absolute,
                             top: 4,
@@ -1073,6 +1292,64 @@ fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         }
                     }).into_iter()
                 )
+
+                // Modal: provider menu
+                #(
+                    provider_menu_open.then(|| element! {
+                        View(
+                            position: Position::Absolute,
+                            top: 4,
+                            left: 10,
+                            background_color: theme.panel_bg,
+                            border_style: BorderStyle::Round,
+                            border_color: theme.focus,
+                            padding_left: 2,
+                            padding_right: 2,
+                            padding_top: 1,
+                            padding_bottom: 1,
+                            flex_direction: FlexDirection::Column,
+                        ) {
+                            Text(
+                                content: if mode.get() == UiMode::ProviderMenuGlobal { "Set global provider config" } else { "Set session provider config" },
+                                weight: Weight::Bold,
+                                color: theme.text
+                            )
+                            Text(content: "Up/Down 选择，Enter 应用，Esc 取消", color: theme.muted)
+                            View(margin_top: 1, flex_direction: FlexDirection::Column) {
+                                #(
+                                    std::iter::once((0usize, "(Clear override)".to_string()))
+                                        .chain(
+                                            providers.iter().enumerate().map(|(i, p)| {
+                                                let label = if let Some(alias) = p.alias.as_deref()
+                                                    && !alias.trim().is_empty()
+                                                    && alias != p.name
+                                                {
+                                                    format!("{} ({})", p.name, alias)
+                                                } else {
+                                                    p.name.clone()
+                                                };
+                                                (i + 1, label)
+                                            })
+                                        )
+                                        .map(|(idx, label)| {
+                                            let selected = idx == provider_menu_idx.get();
+                                            let bg = if selected { Some(theme.selected_bg) } else { None };
+                                            element! {
+                                                View(background_color: bg, padding_left: 1, padding_right: 1) {
+                                                    Text(
+                                                        content: label,
+                                                        color: if selected { theme.text } else { theme.muted },
+                                                        wrap: TextWrap::NoWrap,
+                                                        weight: if selected { Weight::Bold } else { Weight::Normal },
+                                                    )
+                                                }
+                                            }
+                                        })
+                                )
+                            }
+                        }
+                    }).into_iter()
+                )
             }
         }
     }
@@ -1082,6 +1359,7 @@ pub async fn run_dashboard(
     state: Arc<ProxyState>,
     service_name: &'static str,
     port: u16,
+    providers: Vec<ProviderOption>,
     shutdown: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -1092,6 +1370,7 @@ pub async fn run_dashboard(
             port: Some(port),
             shutdown: Some(shutdown),
             shutdown_rx: Some(shutdown_rx),
+            providers: Some(providers),
         )
     };
     el.fullscreen().await?;

@@ -76,6 +76,7 @@ pub fn extract_usage_from_bytes(data: &[u8]) -> Option<UsageMetrics> {
     Some(usage_from_value(usage_obj))
 }
 
+#[allow(dead_code)]
 pub fn extract_usage_from_sse_bytes(data: &[u8]) -> Option<UsageMetrics> {
     let text = std::str::from_utf8(data).ok()?;
     let mut last: Option<UsageMetrics> = None;
@@ -102,4 +103,105 @@ pub fn extract_usage_from_sse_bytes(data: &[u8]) -> Option<UsageMetrics> {
     }
 
     last
+}
+
+/// Incrementally scan SSE bytes for `data: {json}` lines that contain usage information.
+///
+/// This is designed for streaming scenarios where the response arrives in many chunks:
+/// it avoids repeatedly re-parsing the entire buffer (which can become O(n^2)).
+///
+/// - `scan_pos` is an in/out cursor into `data` (byte index).
+/// - `last` stores the latest usage parsed so far (updated in-place).
+pub fn scan_usage_from_sse_bytes_incremental(
+    data: &[u8],
+    scan_pos: &mut usize,
+    last: &mut Option<UsageMetrics>,
+) {
+    let mut i = (*scan_pos).min(data.len());
+
+    while i < data.len() {
+        let Some(rel_end) = data[i..].iter().position(|b| *b == b'\n') else {
+            break;
+        };
+        let end = i + rel_end;
+        let mut line = &data[i..end];
+        i = end.saturating_add(1);
+
+        if line.ends_with(b"\r") {
+            line = &line[..line.len().saturating_sub(1)];
+        }
+        if line.is_empty() {
+            continue;
+        }
+
+        const DATA_PREFIX: &[u8] = b"data:";
+        if !line.starts_with(DATA_PREFIX) {
+            continue;
+        }
+        let mut payload = &line[DATA_PREFIX.len()..];
+        while !payload.is_empty() && payload[0].is_ascii_whitespace() {
+            payload = &payload[1..];
+        }
+        if payload.is_empty() || payload == b"[DONE]" {
+            continue;
+        }
+
+        if let Ok(json) = serde_json::from_slice::<Value>(payload)
+            && let Some(usage_obj) = extract_usage_obj(&json)
+        {
+            *last = Some(usage_from_value(usage_obj));
+        }
+    }
+
+    *scan_pos = i;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn incremental_sse_scan_matches_full_parse() {
+        let sse = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n",
+            "\n",
+            "event: response.completed\n",
+            "data: {\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n",
+            "\n"
+        );
+
+        let full = extract_usage_from_sse_bytes(sse.as_bytes());
+        let mut pos = 0usize;
+        let mut last = None;
+        scan_usage_from_sse_bytes_incremental(sse.as_bytes(), &mut pos, &mut last);
+        assert_eq!(last, full);
+    }
+
+    #[test]
+    fn incremental_sse_scan_handles_split_lines() {
+        let part1 = b"data: {\"response\":{\"usage\":{\"input_tokens\":1";
+        let part2 = b",\"output_tokens\":2,\"total_tokens\":3}}}\n\n";
+        let mut buf = Vec::new();
+        let mut pos = 0usize;
+        let mut last = None;
+
+        buf.extend_from_slice(part1);
+        scan_usage_from_sse_bytes_incremental(&buf, &mut pos, &mut last);
+        assert_eq!(last, None);
+
+        buf.extend_from_slice(part2);
+        scan_usage_from_sse_bytes_incremental(&buf, &mut pos, &mut last);
+        assert_eq!(
+            last,
+            Some(UsageMetrics {
+                input_tokens: 1,
+                output_tokens: 2,
+                reasoning_tokens: 0,
+                total_tokens: 3,
+            })
+        );
+    }
 }

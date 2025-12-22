@@ -1,6 +1,6 @@
 # codex-helper（Codex CLI 本地助手 / 本地代理）
 
-> 让 Codex / Claude Code 走一层本地“保险杠”：  
+> 让 Codex CLI 走一层本地“保险杠”：  
 > 集中管理所有中转站 / key / 配额，在额度用完或上游挂掉时自动切换，并提供会话与脱敏辅助工具。
 
 > English version: `README_EN.md`
@@ -23,7 +23,7 @@
 - **命令行里希望“一键找回 Codex 会话”**  
   例如“给我当前项目最近一次会话，并告诉我怎么 resume”。
 
-- **想给 Codex/Claude 加一层本地脱敏和统一日志**  
+- **想给 Codex 加一层本地脱敏和统一日志**  
   请求先本地过滤敏感信息，再发到上游；所有请求写进一个 JSONL 文件，方便排查和统计。
 
 ---
@@ -54,27 +54,13 @@ ch
 
 - 启动 Codex 本地代理，监听 `127.0.0.1:3211`；
 - 如果在交互终端运行，会默认显示一个内置 TUI 面板（可用 `--no-tui` 关闭；按 `q` 退出）；
+- 对 429/5xx/网络抖动等瞬态错误在**未开始向客户端输出响应**前进行有限次数的自动重试（可配置）；
 - 在修改前检查 `~/.codex/config.toml`，如已指向本地代理且存在备份，会询问是否先恢复原始配置；
 - 必要时修改 `model_provider` 与 `model_providers.codex_proxy`，让 Codex 走本地代理，并只在首次写入备份；
 - 如果 `~/.codex-helper/config.json` 还没初始化，会尝试根据 `~/.codex/config.toml` + `auth.json` 推导一个默认上游；
 - 用 Ctrl+C 或在 TUI 中按 `q` 退出时，尝试从备份恢复原始 Codex 配置。
 
 从此之后，你继续用原来的 `codex` 命令即可，所有请求会自动经过 codex-helper。
-
-### 3. 可选：把“默认目标”切成 Claude（实验）
-
-默认所有命令都以 Codex 为主。如果你主要用 Claude Code，可以这样调整：
-
-```bash
-codex-helper default --claude   # 将默认目标服务改为 Claude（实验）
-```
-
-之后：
-
-- `codex-helper serve`（不加参数）会默认启动 Claude 代理（端口 3210）；
-- `codex-helper config list/add/set-active`（不加 `--codex/--claude`）默认操作 Claude 的配置。
-
-随时可以用 `codex-helper default` 查看当前默认目标服务。
 
 ---
 
@@ -113,9 +99,7 @@ codex-helper default --claude   # 将默认目标服务改为 Claude（实验）
         ]
       }
     }
-  },
-  "claude": { "active": null, "configs": {} },
-  "default_service": null
+  }
 }
 ```
 
@@ -136,67 +120,51 @@ codex-helper default --claude   # 将默认目标服务改为 Claude（实验）
 
 - 启动 Codex 助手（推荐）：
   - `codex-helper` / `ch`
-- 显式启动 Codex / Claude 代理：
-  - `codex-helper serve`（Codex，默认端口 3211）
-  - `codex-helper serve --codex`
-  - `codex-helper serve --claude`（Claude，默认端口 3210）
+- 显式启动 Codex 代理：
+  - `codex-helper serve`（默认端口 3211）
   - `codex-helper serve --no-tui`（关闭内置 TUI 面板）
 
-### 开关 Codex / Claude
+### 开关 Codex
 
-- 一次性让 Codex / Claude 指向本地代理：
+- 一次性让 Codex 指向本地代理：
 
   ```bash
-  codex-helper switch on          # Codex
-  codex-helper switch on --claude # Claude（实验）
+  codex-helper switch on
   ```
 
 - 从备份恢复原始配置：
 
   ```bash
   codex-helper switch off
-  codex-helper switch off --claude
   ```
 
 - 查看当前开关状态：
 
   ```bash
   codex-helper switch status
-  codex-helper switch status --codex
-  codex-helper switch status --claude
   ```
 
 ### 配置管理（上游 / 中转）
 
-- 列出配置（默认 Codex，可显式指定 Claude）：
+- 列出配置：
 
   ```bash
   codex-helper config list
-  codex-helper config list --claude
   ```
 
 - 添加新配置：
 
   ```bash
-  # Codex
   codex-helper config add openai-main \
     --base-url https://api.openai.com/v1 \
     --auth-token-env OPENAI_API_KEY \
     --alias "OpenAI 主额度"
-
-  # Claude（实验）
-  codex-helper config add claude-main \
-    --base-url https://api.anthropic.com/v1 \
-    --auth-token-env ANTHROPIC_AUTH_TOKEN \
-    --alias "Claude 主额度" \
-    --claude
   ```
 
 - 切换当前 active 配置：
 
   ```bash
   codex-helper config set-active openai-main
-  codex-helper config set-active claude-main --claude
   ```
 
 ### 会话、用量与诊断
@@ -266,6 +234,8 @@ codex-helper session list   # 列出与当前项目相关的最近会话
 codex-helper session last   # 给出最近一次会话 + 对应 resume 命令
 ```
 
+`session list` 会额外展示每个会话的轮数（rounds）与最后更新时间（last_update，优先取最后一次 assistant 响应时间）。
+
 你也可以从任意目录查询指定项目的会话：
 
 ```bash
@@ -286,6 +256,7 @@ codex-helper session last --path ~/code/my-app
 - 用量提供商：`~/.codex-helper/usage_providers.json`
 - 请求日志：`~/.codex-helper/logs/requests.jsonl`
 - 详细调试日志（可选）：`~/.codex-helper/logs/requests_debug.jsonl`（仅在启用 `http_debug` 拆分时生成）
+- 会话统计缓存（自动生成）：`~/.codex-helper/cache/session_stats.json`（用于加速 `session list/search` 的轮数/时间统计；以 session 文件 `mtime+size` 作为失效条件，如怀疑不准可直接删除该文件强制重建）
 
 Codex 官方文件：
 
@@ -369,7 +340,7 @@ Codex 官方文件：
   请求 body 在发出前会按规则进行字节级替换 / 删除，规则根据文件 mtime 约 1 秒内自动刷新。
 
 - 请求日志：`~/.codex-helper/logs/requests.jsonl`，每行一个 JSON，字段包括：
-  - `service`（codex/claude）、`method`、`path`、`status_code`、`duration_ms`；
+  - `service`（目前为 `codex`）、`method`、`path`、`status_code`、`duration_ms`；
   - `config_name`、`upstream_base_url`；
   - `usage`（input/output/total_tokens 等）。
   - （可选）`retry`：发生重试/切换上游时记录重试次数与尝试链路（便于回溯问题）。
@@ -393,11 +364,11 @@ Codex 官方文件：
 
 ### 上游重试（默认 2 次尝试）
 
-有些上游错误（例如网络抖动、502/503/504/524、或看起来像 Cloudflare/WAF 的拦截页）可能是瞬态的；codex-helper 支持在**未开始向客户端输出响应**前进行有限次数的重试，并尽量切换到其它 upstream。
+有些上游错误（例如网络抖动、429 限流、502/503/504/524、或看起来像 Cloudflare/WAF 的拦截页）可能是瞬态的；codex-helper 支持在**未开始向客户端输出响应**前进行有限次数的重试，并尽量切换到其它 upstream。
 
 - `~/.codex-helper/config.json` 的 `retry` 段可以设置全局默认值；同名环境变量可在运行时覆盖（用于临时调试）。
 - `CODEX_HELPER_RETRY_MAX_ATTEMPTS=2`：最大尝试次数（默认来自配置的 `retry.max_attempts`，最大 8；如需关闭重试请设为 1）
-- `CODEX_HELPER_RETRY_ON_STATUS=502,503,504,524`：遇到这些状态码时允许重试（支持 `a-b` 区间，例如 `500-599`）
+- `CODEX_HELPER_RETRY_ON_STATUS=429,502,503,504,524`：遇到这些状态码时允许重试（支持 `a-b` 区间，例如 `500-599`；若上游返回 `Retry-After`，会优先按其等待时间退避）
 - `CODEX_HELPER_RETRY_ON_CLASS=upstream_transport_error,cloudflare_timeout,cloudflare_challenge`：按错误分类允许重试
 - `CODEX_HELPER_RETRY_BACKOFF_MS=200` / `CODEX_HELPER_RETRY_BACKOFF_MAX_MS=2000` / `CODEX_HELPER_RETRY_JITTER_MS=100`：重试退避参数（毫秒）
 - `CODEX_HELPER_RETRY_CLOUDFLARE_CHALLENGE_COOLDOWN_SECS=300` / `CODEX_HELPER_RETRY_CLOUDFLARE_TIMEOUT_COOLDOWN_SECS=60` / `CODEX_HELPER_RETRY_TRANSPORT_COOLDOWN_SECS=30`：对触发重试的 upstream 施加冷却（秒）
@@ -411,7 +382,7 @@ Codex 官方文件：
     "backoff_ms": 200,
     "backoff_max_ms": 2000,
     "jitter_ms": 100,
-    "on_status": "502,503,504,524",
+    "on_status": "429,502,503,504,524",
     "on_class": ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challenge"],
     "cloudflare_challenge_cooldown_secs": 300,
     "cloudflare_timeout_cooldown_secs": 60,
@@ -441,6 +412,6 @@ Codex 官方文件：
 
 codex-helper 借鉴了它们的设计思路，但定位更轻量：
 
-- 专注 Codex CLI（附带实验性的 Claude 支持）；
+- 专注 Codex CLI；
 - 单一二进制，无守护进程、无 Web UI；
 - 更适合作为你日常使用的“命令行小助手”，或者集成进你自己的脚本 / 工具链中。

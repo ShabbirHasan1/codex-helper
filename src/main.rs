@@ -635,10 +635,33 @@ async fn run_server(service_name: &'static str, port: u16, enable_tui: bool) -> 
                 .await
         });
 
+        let mut providers: Vec<tui::ProviderOption> = match service_name {
+            "claude" => cfg
+                .claude
+                .configs
+                .iter()
+                .map(|(name, svc)| tui::ProviderOption {
+                    name: name.clone(),
+                    alias: svc.alias.clone(),
+                })
+                .collect(),
+            _ => cfg
+                .codex
+                .configs
+                .iter()
+                .map(|(name, svc)| tui::ProviderOption {
+                    name: name.clone(),
+                    alias: svc.alias.clone(),
+                })
+                .collect(),
+        };
+        providers.sort_by(|a, b| a.name.cmp(&b.name));
+
         let mut tui_handle = tokio::spawn(tui::run_dashboard(
             state,
             service_name,
             port,
+            providers,
             shutdown_tx.clone(),
             shutdown_rx.clone(),
         ));

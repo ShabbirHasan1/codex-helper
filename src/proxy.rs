@@ -5,13 +5,14 @@ use std::time::Instant;
 use anyhow::{Result, anyhow};
 use axum::Json;
 use axum::Router;
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::Query;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use axum::routing::{any, get};
 use futures_util::TryStreamExt;
 use rand::Rng;
 use reqwest::Client;
+use std::sync::OnceLock;
 use tokio::time::sleep;
 use tracing::{info, instrument, warn};
 
@@ -21,7 +22,7 @@ use crate::lb::{LbState, LoadBalancer, SelectedUpstream};
 use crate::logging::{
     AuthResolutionLog, BodyPreview, HeaderEntry, HttpDebugLog, RetryInfo, http_debug_options,
     http_warn_options, log_request_with_debug, make_body_preview, should_include_http_debug,
-    should_include_http_warn,
+    should_include_http_warn, should_log_request_body_preview,
 };
 use crate::state::{ActiveRequest, FinishedRequest, ProxyState};
 use crate::usage::extract_usage_from_bytes;
@@ -453,6 +454,17 @@ fn should_retry_class(opt: &RetryOptions, class: Option<&str>) -> bool {
     opt.retry_error_classes.iter().any(|x| x == c)
 }
 
+fn retry_after_ms(headers: &HeaderMap, opt: &RetryOptions) -> Option<u64> {
+    let raw = headers.get("retry-after")?.to_str().ok()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let seconds = raw.parse::<u64>().ok()?;
+    let ms = seconds.saturating_mul(1000);
+    let cap = opt.max_backoff_ms.max(opt.base_backoff_ms);
+    Some(ms.min(cap))
+}
+
 async fn backoff_sleep(opt: &RetryOptions, attempt_index: u32) {
     if opt.base_backoff_ms == 0 {
         return;
@@ -469,6 +481,21 @@ async fn backoff_sleep(opt: &RetryOptions, attempt_index: u32) {
         capped.saturating_add(jitter),
     ))
     .await;
+}
+
+async fn retry_sleep(opt: &RetryOptions, attempt_index: u32, resp_headers: &HeaderMap) {
+    if let Some(mut ms) = retry_after_ms(resp_headers, opt) {
+        if opt.jitter_ms > 0 {
+            let jitter = rand::thread_rng().gen_range(0..=opt.jitter_ms);
+            let cap = opt.max_backoff_ms.max(opt.base_backoff_ms);
+            ms = ms.saturating_add(jitter).min(cap);
+        }
+        if ms > 0 {
+            sleep(std::time::Duration::from_millis(ms)).await;
+        }
+        return;
+    }
+    backoff_sleep(opt, attempt_index).await;
 }
 
 /// Generic proxy service; currently used by both Codex and Claude.
@@ -509,13 +536,36 @@ impl ProxyService {
         }
     }
 
-    fn lb(&self) -> Option<LoadBalancer> {
+    async fn effective_config_name(&self, session_id: Option<&str>) -> Option<String> {
+        if let Some(sid) = session_id
+            && let Some(name) = self.state.get_session_config_override(sid).await
+            && !name.trim().is_empty()
+        {
+            return Some(name);
+        }
+        if let Some(name) = self.state.get_global_config_override().await
+            && !name.trim().is_empty()
+        {
+            return Some(name);
+        }
         let mgr = self.service_manager();
-        let svc = mgr.active_config()?;
-        Some(LoadBalancer::new(
-            Arc::new(svc.clone()),
-            self.lb_states.clone(),
-        ))
+        if let Some(name) = mgr.active.as_deref()
+            && !name.trim().is_empty()
+        {
+            return Some(name.to_string());
+        }
+        mgr.active_config().map(|svc| svc.name.clone())
+    }
+
+    async fn lb_for_request(&self, session_id: Option<&str>) -> Option<LoadBalancer> {
+        let mgr = self.service_manager();
+        let name = self.effective_config_name(session_id).await?;
+        let svc = mgr
+            .configs
+            .get(&name)
+            .or_else(|| mgr.active_config())
+            .cloned()?;
+        Some(LoadBalancer::new(Arc::new(svc), self.lb_states.clone()))
     }
 
     fn build_target(
@@ -622,18 +672,22 @@ pub async fn handle_proxy(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    let uri = req.uri().clone();
-    let method = req.method().clone();
-    let client_headers = req.headers().clone();
-    let client_headers_entries = header_map_to_entries(&client_headers);
+    let (parts, body) = req.into_parts();
+    let uri = parts.uri;
+    let method = parts.method;
+    let client_headers = parts.headers;
+    let client_headers_entries_cache: OnceLock<Vec<HeaderEntry>> = OnceLock::new();
 
     let session_id = extract_session_id(&client_headers);
 
-    let lb = match proxy.lb() {
+    let lb = match proxy.lb_for_request(session_id.as_deref()).await {
         Some(lb) => lb,
         None => {
             let dur = start.elapsed().as_millis() as u64;
             let status = StatusCode::BAD_GATEWAY;
+            let client_headers_entries = client_headers_entries_cache
+                .get_or_init(|| header_map_to_entries(&client_headers))
+                .clone();
             let http_debug = if should_include_http_warn(status.as_u16()) {
                 Some(HttpDebugLog {
                     request_body_len: None,
@@ -649,7 +703,7 @@ pub async fn handle_proxy(
                     upstream_cf_ray: None,
                     client_uri: uri.to_string(),
                     target_url: "-".to_string(),
-                    client_headers: client_headers_entries.clone(),
+                    client_headers: client_headers_entries,
                     upstream_request_headers: Vec::new(),
                     auth_resolution: None,
                     client_body: None,
@@ -681,12 +735,10 @@ pub async fn handle_proxy(
     };
     let client_content_type = client_headers
         .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+        .and_then(|v| v.to_str().ok());
 
     // Detect streaming (SSE).
-    let is_stream = req
-        .headers()
+    let is_stream = client_headers
         .get("accept")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.contains("text/event-stream"))
@@ -704,16 +756,22 @@ pub async fn handle_proxy(
     };
     if let Some(id) = session_id.as_deref() {
         proxy.state.touch_session_override(id, started_at_ms).await;
+        proxy
+            .state
+            .touch_session_config_override(id, started_at_ms)
+            .await;
     }
 
     // Read request body and apply filters.
-    let body = req.into_body();
     let raw_body = match to_bytes(body, 10 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
             let dur = start.elapsed().as_millis() as u64;
             let status = StatusCode::BAD_REQUEST;
             let err_str = e.to_string();
+            let client_headers_entries = client_headers_entries_cache
+                .get_or_init(|| header_map_to_entries(&client_headers))
+                .clone();
             let http_debug = if should_include_http_warn(status.as_u16()) {
                 Some(HttpDebugLog {
                     request_body_len: None,
@@ -728,7 +786,7 @@ pub async fn handle_proxy(
                     upstream_cf_ray: None,
                     client_uri: uri.to_string(),
                     target_url: "-".to_string(),
-                    client_headers: client_headers_entries.clone(),
+                    client_headers: client_headers_entries,
                     upstream_request_headers: Vec::new(),
                     auth_resolution: None,
                     client_body: None,
@@ -767,13 +825,16 @@ pub async fn handle_proxy(
     let effective_effort = override_effort.clone().or(original_effort.clone());
 
     let body_for_upstream = if let Some(ref effort) = override_effort {
-        apply_reasoning_effort_override(&raw_body, effort).unwrap_or_else(|| raw_body.to_vec())
+        Bytes::from(
+            apply_reasoning_effort_override(&raw_body, effort)
+                .unwrap_or_else(|| raw_body.as_ref().to_vec()),
+        )
     } else {
-        raw_body.to_vec()
+        raw_body.clone()
     };
-    let request_model = extract_model_from_request_body(&body_for_upstream);
+    let request_model = extract_model_from_request_body(body_for_upstream.as_ref());
 
-    let filtered_body = proxy.filter.apply(&body_for_upstream);
+    let filtered_body = proxy.filter.apply_bytes(body_for_upstream);
     let request_body_len = raw_body.len();
     let upstream_request_body_len = filtered_body.len();
 
@@ -789,37 +850,30 @@ pub async fn handle_proxy(
     } else {
         0
     };
-    let client_body_debug = if debug_max > 0 {
+    let request_body_previews = should_log_request_body_preview();
+    let client_body_debug = if request_body_previews && debug_max > 0 {
+        Some(make_body_preview(&raw_body, client_content_type, debug_max))
+    } else {
+        None
+    };
+    let upstream_request_body_debug = if request_body_previews && debug_max > 0 {
         Some(make_body_preview(
-            &raw_body,
-            client_content_type.as_deref(),
+            &filtered_body,
+            client_content_type,
             debug_max,
         ))
     } else {
         None
     };
-    let upstream_request_body_debug = if debug_max > 0 {
-        Some(make_body_preview(
-            &filtered_body,
-            client_content_type.as_deref(),
-            debug_max,
-        ))
+    let client_body_warn = if request_body_previews && warn_max > 0 {
+        Some(make_body_preview(&raw_body, client_content_type, warn_max))
     } else {
         None
     };
-    let client_body_warn = if warn_max > 0 {
-        Some(make_body_preview(
-            &raw_body,
-            client_content_type.as_deref(),
-            warn_max,
-        ))
-    } else {
-        None
-    };
-    let upstream_request_body_warn = if warn_max > 0 {
+    let upstream_request_body_warn = if request_body_previews && warn_max > 0 {
         Some(make_body_preview(
             &filtered_body,
-            client_content_type.as_deref(),
+            client_content_type,
             warn_max,
         ))
     } else {
@@ -895,6 +949,9 @@ pub async fn handle_proxy(
 
                 let dur = start.elapsed().as_millis() as u64;
                 let status = StatusCode::BAD_GATEWAY;
+                let client_headers_entries = client_headers_entries_cache
+                    .get_or_init(|| header_map_to_entries(&client_headers))
+                    .clone();
                 let http_debug = if should_include_http_warn(status.as_u16()) {
                     Some(HttpDebugLog {
                         request_body_len: Some(request_body_len),
@@ -909,7 +966,7 @@ pub async fn handle_proxy(
                         upstream_cf_ray: None,
                         client_uri: uri.to_string(),
                         target_url: "-".to_string(),
-                        client_headers: client_headers_entries.clone(),
+                        client_headers: client_headers_entries,
                         upstream_request_headers: Vec::new(),
                         auth_resolution: None,
                         client_body: client_body_warn.clone(),
@@ -997,7 +1054,9 @@ pub async fn handle_proxy(
                 upstream_request_body_len,
                 client_uri: uri.to_string(),
                 target_url: target_url.to_string(),
-                client_headers: client_headers_entries.clone(),
+                client_headers: client_headers_entries_cache
+                    .get_or_init(|| header_map_to_entries(&client_headers))
+                    .clone(),
                 upstream_request_headers: header_map_to_entries(&upstream_request_headers),
                 auth_resolution: Some(auth_resolution),
                 client_body_debug: client_body_debug.clone(),
@@ -1182,6 +1241,8 @@ pub async fn handle_proxy(
                 finished: bool,
                 warned_non_success: bool,
                 first_chunk_ms: Option<u64>,
+                usage: Option<crate::usage::UsageMetrics>,
+                usage_scan_pos: usize,
             }
 
             struct StreamFinalize {
@@ -1280,7 +1341,7 @@ pub async fn handle_proxy(
                     }
                     guard.finished = true;
                     let already_logged = guard.logged;
-                    let usage_for_state = crate::usage::extract_usage_from_sse_bytes(&guard.buffer);
+                    let usage_for_state = guard.usage.clone();
 
                     let dur = self.start.elapsed().as_millis() as u64;
 
@@ -1427,7 +1488,20 @@ pub async fn handle_proxy(
                 if guard.logged {
                     return;
                 }
-                if let Some(usage) = crate::usage::extract_usage_from_sse_bytes(&guard.buffer) {
+                {
+                    let StreamUsageState {
+                        buffer,
+                        usage_scan_pos,
+                        usage,
+                        ..
+                    } = &mut *guard;
+                    crate::usage::scan_usage_from_sse_bytes_incremental(
+                        buffer.as_slice(),
+                        usage_scan_pos,
+                        usage,
+                    );
+                }
+                if let Some(usage) = guard.usage.clone() {
                     guard.logged = true;
                     let dur = start_time.elapsed().as_millis() as u64;
                     let http_debug = if should_include_http_debug(status_code) {
@@ -1587,7 +1661,7 @@ pub async fn handle_proxy(
                     _ => {}
                 }
                 avoid.insert(selected.index);
-                backoff_sleep(&retry_opt, attempt_index).await;
+                retry_sleep(&retry_opt, attempt_index, &resp_headers).await;
                 continue;
             }
 
@@ -1756,6 +1830,9 @@ pub async fn handle_proxy(
     let dur = start.elapsed().as_millis() as u64;
     let status = StatusCode::BAD_GATEWAY;
     let http_debug = if should_include_http_warn(status.as_u16()) {
+        let client_headers_entries = client_headers_entries_cache
+            .get_or_init(|| header_map_to_entries(&client_headers))
+            .clone();
         Some(HttpDebugLog {
             request_body_len: Some(request_body_len),
             upstream_request_body_len: Some(upstream_request_body_len),
@@ -1767,7 +1844,7 @@ pub async fn handle_proxy(
             upstream_cf_ray: None,
             client_uri: uri.to_string(),
             target_url: "-".to_string(),
-            client_headers: client_headers_entries.clone(),
+            client_headers: client_headers_entries,
             upstream_request_headers: Vec::new(),
             auth_resolution: None,
             client_body: client_body_warn.clone(),
@@ -1895,4 +1972,37 @@ pub fn router(proxy: ProxyService) -> Router {
             get(move |q| list_recent_finished(p4.clone(), q)),
         )
         .route("/{*path}", any(move |req| handle_proxy(p2.clone(), req)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn parse_status_ranges_accepts_single_codes_and_ranges() {
+        assert_eq!(
+            parse_status_ranges("429,500-599"),
+            vec![(429, 429), (500, 599)]
+        );
+    }
+
+    #[test]
+    fn retry_after_ms_parses_seconds_and_caps() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("10"));
+        let opt = RetryOptions {
+            max_attempts: 3,
+            base_backoff_ms: 200,
+            max_backoff_ms: 2_000,
+            jitter_ms: 0,
+            retry_status_ranges: vec![(429, 429)],
+            retry_error_classes: Vec::new(),
+            cloudflare_challenge_cooldown_secs: 0,
+            cloudflare_timeout_cooldown_secs: 0,
+            transport_cooldown_secs: 0,
+        };
+        assert_eq!(retry_after_ms(&headers, &opt), Some(2_000));
+    }
 }

@@ -92,6 +92,14 @@ struct SessionEffortOverride {
 }
 
 #[derive(Debug, Clone)]
+struct SessionConfigOverride {
+    config_name: String,
+    #[allow(dead_code)]
+    updated_at_ms: u64,
+    last_seen_ms: u64,
+}
+
+#[derive(Debug, Clone)]
 struct SessionCwdCacheEntry {
     cwd: Option<String>,
     last_seen_ms: u64,
@@ -107,6 +115,8 @@ pub struct ProxyState {
     session_cwd_cache_ttl_ms: u64,
     session_cwd_cache_max_entries: usize,
     session_effort_overrides: RwLock<HashMap<String, SessionEffortOverride>>,
+    session_config_overrides: RwLock<HashMap<String, SessionConfigOverride>>,
+    global_config_override: RwLock<Option<String>>,
     session_cwd_cache: RwLock<HashMap<String, SessionCwdCacheEntry>>,
     session_stats: RwLock<HashMap<String, SessionStats>>,
     active_requests: RwLock<HashMap<u64, ActiveRequest>>,
@@ -138,6 +148,8 @@ impl ProxyState {
             session_cwd_cache_ttl_ms: cwd_cache_ttl_ms,
             session_cwd_cache_max_entries: cwd_cache_max_entries,
             session_effort_overrides: RwLock::new(HashMap::new()),
+            session_config_overrides: RwLock::new(HashMap::new()),
+            global_config_override: RwLock::new(None),
             session_cwd_cache: RwLock::new(HashMap::new()),
             session_stats: RwLock::new(HashMap::new()),
             active_requests: RwLock::new(HashMap::new()),
@@ -185,6 +197,63 @@ impl ProxyState {
         if let Some(v) = guard.get_mut(session_id) {
             v.last_seen_ms = now_ms;
         }
+    }
+
+    pub async fn get_session_config_override(&self, session_id: &str) -> Option<String> {
+        let guard = self.session_config_overrides.read().await;
+        guard.get(session_id).map(|v| v.config_name.clone())
+    }
+
+    pub async fn set_session_config_override(
+        &self,
+        session_id: String,
+        config_name: String,
+        now_ms: u64,
+    ) {
+        let mut guard = self.session_config_overrides.write().await;
+        guard.insert(
+            session_id,
+            SessionConfigOverride {
+                config_name,
+                updated_at_ms: now_ms,
+                last_seen_ms: now_ms,
+            },
+        );
+    }
+
+    pub async fn clear_session_config_override(&self, session_id: &str) {
+        let mut guard = self.session_config_overrides.write().await;
+        guard.remove(session_id);
+    }
+
+    pub async fn list_session_config_overrides(&self) -> HashMap<String, String> {
+        let guard = self.session_config_overrides.read().await;
+        guard
+            .iter()
+            .map(|(k, v)| (k.clone(), v.config_name.clone()))
+            .collect()
+    }
+
+    pub async fn touch_session_config_override(&self, session_id: &str, now_ms: u64) {
+        let mut guard = self.session_config_overrides.write().await;
+        if let Some(v) = guard.get_mut(session_id) {
+            v.last_seen_ms = now_ms;
+        }
+    }
+
+    pub async fn get_global_config_override(&self) -> Option<String> {
+        let guard = self.global_config_override.read().await;
+        guard.clone()
+    }
+
+    pub async fn set_global_config_override(&self, config_name: String) {
+        let mut guard = self.global_config_override.write().await;
+        *guard = Some(config_name);
+    }
+
+    pub async fn clear_global_config_override(&self) {
+        let mut guard = self.global_config_override.write().await;
+        *guard = None;
     }
 
     pub async fn resolve_session_cwd(&self, session_id: &str) -> Option<String> {
@@ -391,6 +460,17 @@ impl ProxyState {
         if self.session_override_ttl_ms > 0 && now_ms >= self.session_override_ttl_ms {
             let cutoff_override = now_ms - self.session_override_ttl_ms;
             let mut overrides = self.session_effort_overrides.write().await;
+            overrides.retain(|sid, v| {
+                if active_sessions.contains_key(sid) {
+                    return true;
+                }
+                v.last_seen_ms >= cutoff_override
+            });
+        }
+
+        if self.session_override_ttl_ms > 0 && now_ms >= self.session_override_ttl_ms {
+            let cutoff_override = now_ms - self.session_override_ttl_ms;
+            let mut overrides = self.session_config_overrides.write().await;
             overrides.retain(|sid, v| {
                 if active_sessions.contains_key(sid) {
                     return true;

@@ -1,10 +1,13 @@
 use std::cmp::{Ordering, Reverse};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
 
 use crate::config::codex_sessions_dir;
 
@@ -16,11 +19,141 @@ pub struct SessionSummary {
     pub cwd: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    /// RFC3339 timestamp string for the most recent assistant message, if available.
+    pub last_response_at: Option<String>,
+    /// Number of user turns (from `event_msg` user_message).
+    pub user_turns: usize,
+    /// Number of assistant messages (from `response_item` message role=assistant).
+    pub assistant_turns: usize,
+    /// Conversation rounds (best-effort; currently `min(user_turns, assistant_turns)`).
+    pub rounds: usize,
     pub first_user_message: Option<String>,
-    pub is_cwd_match: bool,
 }
 
 const MAX_SCAN_FILES: usize = 10_000;
+const HEAD_SCAN_LINES: usize = 512;
+const IO_CHUNK_SIZE: usize = 64 * 1024;
+const TAIL_SCAN_MAX_BYTES: usize = 1024 * 1024;
+
+const SESSION_STATS_CACHE_VERSION: u32 = 1;
+const MAX_STATS_CACHE_ENTRIES: usize = 20_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedSessionStats {
+    mtime_ms: u64,
+    size: u64,
+    user_turns: usize,
+    assistant_turns: usize,
+    last_response_at: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SessionStatsCacheFile {
+    version: u32,
+    entries: HashMap<String, CachedSessionStats>,
+}
+
+struct SessionStatsCache {
+    path: PathBuf,
+    data: SessionStatsCacheFile,
+    dirty: bool,
+}
+
+impl SessionStatsCache {
+    async fn load_default() -> Self {
+        let path = crate::config::proxy_home_dir()
+            .join("cache")
+            .join("session_stats.json");
+        let mut cache = Self {
+            path,
+            data: SessionStatsCacheFile {
+                version: SESSION_STATS_CACHE_VERSION,
+                entries: HashMap::new(),
+            },
+            dirty: false,
+        };
+        let bytes = match fs::read(&cache.path).await {
+            Ok(b) => b,
+            Err(_) => return cache,
+        };
+        let parsed = serde_json::from_slice::<SessionStatsCacheFile>(&bytes);
+        if let Ok(mut data) = parsed {
+            if data.version != SESSION_STATS_CACHE_VERSION {
+                data.version = SESSION_STATS_CACHE_VERSION;
+                data.entries.clear();
+                cache.dirty = true;
+            }
+            cache.data = data;
+        }
+        cache
+    }
+
+    async fn save_if_dirty(&mut self) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        if self.data.entries.len() > MAX_STATS_CACHE_ENTRIES {
+            // Best-effort bounding: drop everything to avoid unbounded growth.
+            self.data.entries.clear();
+        }
+
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).await.ok();
+        }
+
+        let tmp = self.path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec_pretty(&self.data)?;
+        fs::write(&tmp, bytes).await?;
+        fs::rename(&tmp, &self.path).await?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    async fn get_or_compute(&mut self, path: &Path) -> Result<(usize, usize, Option<String>)> {
+        let key = path.to_string_lossy().to_string();
+        let meta = fs::metadata(path)
+            .await
+            .with_context(|| format!("failed to stat session file {:?}", path))?;
+        let size = meta.len();
+        let mtime_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        if mtime_ms > 0
+            && let Some(cached) = self.data.entries.get(&key)
+            && cached.mtime_ms == mtime_ms
+            && cached.size == size
+        {
+            return Ok((
+                cached.user_turns,
+                cached.assistant_turns,
+                cached.last_response_at.clone(),
+            ));
+        }
+
+        let (user_turns, assistant_turns) = count_turns_in_file(path).await?;
+        let last_response_at = read_last_assistant_timestamp_from_tail(path).await?;
+
+        if mtime_ms > 0 {
+            self.data.entries.insert(
+                key,
+                CachedSessionStats {
+                    mtime_ms,
+                    size,
+                    user_turns,
+                    assistant_turns,
+                    last_response_at: last_response_at.clone(),
+                },
+            );
+            self.dirty = true;
+        }
+
+        Ok((user_turns, assistant_turns, last_response_at))
+    }
+}
 
 /// Find recent Codex sessions for a given directory, preferring sessions whose cwd matches that directory
 /// (or one of its ancestors/descendants). Results are ordered newest-first by updated_at.
@@ -33,8 +166,8 @@ pub async fn find_codex_sessions_for_dir(
         return Ok(Vec::new());
     }
 
-    let mut matched: Vec<SessionSummary> = Vec::new();
-    let mut others: Vec<SessionSummary> = Vec::new();
+    let mut matched: Vec<SessionHeader> = Vec::new();
+    let mut others: Vec<SessionHeader> = Vec::new();
     let mut scanned_files: usize = 0;
 
     let year_dirs = collect_dirs_desc(&root, |s| s.parse::<u32>().ok()).await?;
@@ -51,42 +184,22 @@ pub async fn find_codex_sessions_for_dir(
                     }
                     scanned_files += 1;
 
-                    let summary_opt = summarize_session_for_current_dir(&path, root_dir).await?;
-                    let Some(summary) = summary_opt else {
+                    let header_opt = read_session_header(&path, root_dir).await?;
+                    let Some(header) = header_opt else {
                         continue;
                     };
 
-                    // Skip sessions with no user messages (e.g. Codex started but no prompt was sent).
-                    if summary.first_user_message.is_none() {
-                        continue;
-                    }
-
-                    if summary.is_cwd_match {
-                        matched.push(summary);
+                    if header.is_cwd_match {
+                        matched.push(header);
                     } else {
-                        others.push(summary);
-                    }
-
-                    if matched.len() >= limit && others.len() >= limit {
-                        // We already have enough candidates from both sets; allow early exit.
-                        if scanned_files >= MAX_SCAN_FILES {
-                            break 'outer;
-                        }
+                        others.push(header);
                     }
                 }
             }
         }
     }
 
-    if !matched.is_empty() {
-        sort_by_updated_desc(&mut matched);
-        matched.truncate(limit);
-        Ok(matched)
-    } else {
-        sort_by_updated_desc(&mut others);
-        others.truncate(limit);
-        Ok(others)
-    }
+    select_and_expand_headers(matched, others, limit).await
 }
 
 /// Search Codex sessions for user messages containing the given substring.
@@ -96,19 +209,54 @@ pub async fn search_codex_sessions_for_dir(
     query: &str,
     limit: usize,
 ) -> Result<Vec<SessionSummary>> {
-    let mut sessions = find_codex_sessions_for_dir(root_dir, usize::MAX).await?;
     let needle = query.to_lowercase();
-    sessions.retain(|s| {
-        s.first_user_message
-            .as_deref()
-            .map(|m| m.to_lowercase().contains(&needle))
-            .unwrap_or(false)
-    });
-    sort_by_updated_desc(&mut sessions);
-    if sessions.len() > limit {
-        sessions.truncate(limit);
+
+    let root = codex_sessions_dir();
+    if !root.exists() {
+        return Ok(Vec::new());
     }
-    Ok(sessions)
+
+    let mut matched: Vec<SessionHeader> = Vec::new();
+    let mut others: Vec<SessionHeader> = Vec::new();
+    let mut scanned_files: usize = 0;
+
+    let year_dirs = collect_dirs_desc(&root, |s| s.parse::<u32>().ok()).await?;
+
+    'outer: for (_year, year_path) in year_dirs {
+        let month_dirs = collect_dirs_desc(&year_path, |s| s.parse::<u8>().ok()).await?;
+        for (_month, month_path) in month_dirs {
+            let day_dirs = collect_dirs_desc(&month_path, |s| s.parse::<u8>().ok()).await?;
+            for (_day, day_path) in day_dirs {
+                let day_files = collect_rollout_files_sorted(&day_path).await?;
+                for path in day_files {
+                    if scanned_files >= MAX_SCAN_FILES {
+                        break 'outer;
+                    }
+                    scanned_files += 1;
+
+                    let header_opt = read_session_header(&path, root_dir).await?;
+                    let Some(header) = header_opt else {
+                        continue;
+                    };
+                    if !header
+                        .first_user_message
+                        .to_lowercase()
+                        .contains(needle.as_str())
+                    {
+                        continue;
+                    }
+
+                    if header.is_cwd_match {
+                        matched.push(header);
+                    } else {
+                        others.push(header);
+                    }
+                }
+            }
+        }
+    }
+
+    select_and_expand_headers(matched, others, limit).await
 }
 
 /// Convenience wrapper that uses the current working directory as the root for session matching.
@@ -181,81 +329,36 @@ pub async fn find_codex_session_cwd_by_id(session_id: &str) -> Result<Option<Str
     Ok(None)
 }
 
+#[cfg(test)]
 async fn summarize_session_for_current_dir(
     path: &Path,
     cwd: &Path,
 ) -> Result<Option<SessionSummary>> {
-    let file = fs::File::open(path)
-        .await
-        .with_context(|| format!("failed to open session file {:?}", path))?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-
-    let mut session_id: Option<String> = None;
-    let mut cwd_str: Option<String> = None;
-    let mut created_at: Option<String> = None;
-    let mut first_user_message: Option<String> = None;
-    let mut last_timestamp: Option<String> = None;
-
-    while let Some(line) = lines.next_line().await? {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let value: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        if last_timestamp.is_none()
-            && let Some(ts) = value.get("timestamp").and_then(|v| v.as_str())
-        {
-            last_timestamp = Some(ts.to_string());
-        }
-
-        if session_id.is_none()
-            && let Some(meta) = parse_session_meta(&value)
-        {
-            session_id = Some(meta.id);
-            cwd_str = meta.cwd;
-            created_at = meta.created_at;
-        }
-
-        if first_user_message.is_none()
-            && let Some(msg) = parse_user_message(&value)
-        {
-            first_user_message = Some(msg);
-        }
-    }
-
-    let id = match session_id {
-        Some(id) => id,
-        None => return Ok(None),
+    let header_opt = read_session_header(path, cwd).await?;
+    let Some(header) = header_opt else {
+        return Ok(None);
     };
-
-    let cwd_value = cwd_str.clone();
-    let is_cwd_match = cwd_value
-        .as_deref()
-        .map(|s| path_matches_current_dir(s, cwd))
-        .unwrap_or(false);
-
-    let updated_at = last_timestamp.or_else(|| created_at.clone());
-
-    Ok(Some(SessionSummary {
-        id,
-        path: path.to_path_buf(),
-        cwd: cwd_value,
-        created_at,
-        updated_at,
-        first_user_message,
-        is_cwd_match,
-    }))
+    Ok(Some(expand_header_to_summary_uncached(header).await?))
 }
 
 struct SessionMetaInfo {
     id: String,
     cwd: Option<String>,
     created_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionHeader {
+    id: String,
+    path: PathBuf,
+    cwd: Option<String>,
+    created_at: Option<String>,
+    /// File modified time in milliseconds since epoch (used for cheap recency sorting).
+    mtime_ms: u64,
+    /// Best-effort: timestamp of the most recent JSONL record (from the file tail; only computed for displayed rows).
+    updated_hint: Option<String>,
+    first_user_message: String,
+    is_cwd_match: bool,
 }
 
 fn parse_session_meta(value: &Value) -> Option<SessionMetaInfo> {
@@ -288,7 +391,7 @@ fn parse_session_meta(value: &Value) -> Option<SessionMetaInfo> {
     })
 }
 
-fn parse_user_message(value: &Value) -> Option<String> {
+fn user_message_text<'a>(value: &'a Value) -> Option<&'a str> {
     let obj = value.as_object()?;
     let type_str = obj.get("type")?.as_str()?;
     if type_str != "event_msg" {
@@ -299,8 +402,331 @@ fn parse_user_message(value: &Value) -> Option<String> {
     if payload_type != "user_message" {
         return None;
     }
-    let msg = payload.get("message").and_then(|v| v.as_str())?;
-    Some(msg.to_string())
+    payload.get("message").and_then(|v| v.as_str())
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+async fn read_session_header(path: &Path, cwd: &Path) -> Result<Option<SessionHeader>> {
+    let meta = fs::metadata(path)
+        .await
+        .with_context(|| format!("failed to stat session file {:?}", path))?;
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let file = fs::File::open(path)
+        .await
+        .with_context(|| format!("failed to open session file {:?}", path))?;
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+
+    let mut session_id: Option<String> = None;
+    let mut cwd_str: Option<String> = None;
+    let mut created_at: Option<String> = None;
+    let mut first_user_message: Option<String> = None;
+
+    let mut lines_scanned = 0usize;
+    while let Some(line) = lines.next_line().await? {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        lines_scanned += 1;
+        if lines_scanned > HEAD_SCAN_LINES {
+            break;
+        }
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if session_id.is_none()
+            && let Some(meta) = parse_session_meta(&value)
+        {
+            session_id = Some(meta.id);
+            cwd_str = meta.cwd;
+            created_at = meta.created_at;
+        }
+
+        if first_user_message.is_none()
+            && let Some(msg) = user_message_text(&value)
+        {
+            first_user_message = Some(msg.to_string());
+        }
+
+        if session_id.is_some() && first_user_message.is_some() {
+            break;
+        }
+    }
+
+    let Some(id) = session_id else {
+        return Ok(None);
+    };
+    let Some(first_user_message) = first_user_message else {
+        return Ok(None);
+    };
+
+    let cwd_value = cwd_str.clone();
+    let is_cwd_match = cwd_value
+        .as_deref()
+        .map(|s| path_matches_current_dir(s, cwd))
+        .unwrap_or(false);
+
+    Ok(Some(SessionHeader {
+        id,
+        path: path.to_path_buf(),
+        cwd: cwd_value,
+        created_at,
+        mtime_ms,
+        updated_hint: None,
+        first_user_message,
+        is_cwd_match,
+    }))
+}
+
+async fn select_and_expand_headers(
+    matched: Vec<SessionHeader>,
+    others: Vec<SessionHeader>,
+    limit: usize,
+) -> Result<Vec<SessionSummary>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut chosen = if !matched.is_empty() { matched } else { others };
+    // Use file mtime for cheap recency ordering; this correctly surfaces sessions that were resumed
+    // (older filename timestamp but recently appended to).
+    chosen.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    if chosen.len() > limit {
+        chosen.truncate(limit);
+    }
+    // Only for the rows we will display, compute a more precise timestamp from the JSONL tail.
+    for header in &mut chosen {
+        header.updated_hint = read_last_timestamp_from_tail(&header.path)
+            .await?
+            .or_else(|| header.created_at.clone());
+    }
+
+    let mut cache = SessionStatsCache::load_default().await;
+    let mut out: Vec<SessionSummary> = Vec::with_capacity(chosen.len().min(limit));
+    for header in chosen {
+        out.push(expand_header_to_summary(&mut cache, header).await?);
+    }
+    cache.save_if_dirty().await?;
+    sort_by_updated_desc(&mut out);
+    out.truncate(limit);
+    Ok(out)
+}
+
+fn build_summary_from_stats(
+    header: SessionHeader,
+    user_turns: usize,
+    assistant_turns: usize,
+    last_response_at: Option<String>,
+) -> SessionSummary {
+    let rounds = user_turns.min(assistant_turns);
+    let updated_at = last_response_at
+        .clone()
+        .or_else(|| header.updated_hint.clone())
+        .or_else(|| header.created_at.clone());
+
+    SessionSummary {
+        id: header.id,
+        path: header.path,
+        cwd: header.cwd,
+        created_at: header.created_at,
+        updated_at,
+        last_response_at,
+        user_turns,
+        assistant_turns,
+        rounds,
+        first_user_message: Some(header.first_user_message),
+    }
+}
+
+async fn expand_header_to_summary(
+    cache: &mut SessionStatsCache,
+    header: SessionHeader,
+) -> Result<SessionSummary> {
+    let (user_turns, assistant_turns, last_response_at) =
+        cache.get_or_compute(&header.path).await?;
+    Ok(build_summary_from_stats(
+        header,
+        user_turns,
+        assistant_turns,
+        last_response_at,
+    ))
+}
+
+#[cfg(test)]
+async fn expand_header_to_summary_uncached(header: SessionHeader) -> Result<SessionSummary> {
+    let (user_turns, assistant_turns) = count_turns_in_file(&header.path).await?;
+    let last_response_at = read_last_assistant_timestamp_from_tail(&header.path).await?;
+    Ok(build_summary_from_stats(
+        header,
+        user_turns,
+        assistant_turns,
+        last_response_at,
+    ))
+}
+
+async fn count_turns_in_file(path: &Path) -> Result<(usize, usize)> {
+    const USER_TURN_NEEDLE: &[u8] = br#""payload":{"type":"user_message""#;
+    const ASSISTANT_TURN_NEEDLE: &[u8] = br#""role":"assistant""#;
+
+    let mut file = fs::File::open(path)
+        .await
+        .with_context(|| format!("failed to open session file {:?}", path))?;
+
+    let mut buf = vec![0u8; IO_CHUNK_SIZE];
+    let mut user_carry: Vec<u8> = Vec::new();
+    let mut assistant_carry: Vec<u8> = Vec::new();
+    let mut user_total = 0usize;
+    let mut assistant_total = 0usize;
+    let mut user_window: Vec<u8> = Vec::with_capacity(IO_CHUNK_SIZE + USER_TURN_NEEDLE.len());
+    let mut assistant_window: Vec<u8> =
+        Vec::with_capacity(IO_CHUNK_SIZE + ASSISTANT_TURN_NEEDLE.len());
+
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+
+        user_window.clear();
+        user_window.extend_from_slice(&user_carry);
+        user_window.extend_from_slice(&buf[..n]);
+        user_total = user_total.saturating_add(count_subslice(&user_window, USER_TURN_NEEDLE));
+
+        assistant_window.clear();
+        assistant_window.extend_from_slice(&assistant_carry);
+        assistant_window.extend_from_slice(&buf[..n]);
+        assistant_total = assistant_total
+            .saturating_add(count_subslice(&assistant_window, ASSISTANT_TURN_NEEDLE));
+
+        let user_keep = USER_TURN_NEEDLE.len().saturating_sub(1);
+        user_carry = if user_keep > 0 && user_window.len() >= user_keep {
+            user_window[user_window.len() - user_keep..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        let assistant_keep = ASSISTANT_TURN_NEEDLE.len().saturating_sub(1);
+        assistant_carry = if assistant_keep > 0 && assistant_window.len() >= assistant_keep {
+            assistant_window[assistant_window.len() - assistant_keep..].to_vec()
+        } else {
+            Vec::new()
+        };
+    }
+
+    Ok((user_total, assistant_total))
+}
+
+fn count_subslice(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    if haystack.len() < needle.len() {
+        return 0;
+    }
+    haystack
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count()
+}
+
+async fn read_last_timestamp_from_tail(path: &Path) -> Result<Option<String>> {
+    scan_tail_for_timestamp(path, None).await
+}
+
+async fn read_last_assistant_timestamp_from_tail(path: &Path) -> Result<Option<String>> {
+    scan_tail_for_timestamp(path, Some(br#""role":"assistant""#)).await
+}
+
+async fn scan_tail_for_timestamp(
+    path: &Path,
+    required_substring: Option<&[u8]>,
+) -> Result<Option<String>> {
+    let mut file = fs::File::open(path)
+        .await
+        .with_context(|| format!("failed to open session file {:?}", path))?;
+    let meta = file
+        .metadata()
+        .await
+        .with_context(|| format!("failed to stat session file {:?}", path))?;
+    let mut pos = meta.len();
+    if pos == 0 {
+        return Ok(None);
+    }
+
+    let mut scanned = 0usize;
+    let mut carry: Vec<u8> = Vec::new();
+    let chunk_size = IO_CHUNK_SIZE as u64;
+
+    while pos > 0 && scanned < TAIL_SCAN_MAX_BYTES {
+        let start = pos.saturating_sub(chunk_size);
+        let size = (pos - start) as usize;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+
+        let mut chunk = vec![0u8; size];
+        file.read_exact(&mut chunk).await?;
+        scanned = scanned.saturating_add(size);
+
+        if !carry.is_empty() {
+            chunk.extend_from_slice(&carry);
+        }
+
+        // Iterate lines from the end.
+        let mut end = chunk.len();
+        while end > 0 {
+            let mut begin = end;
+            while begin > 0 && chunk[begin - 1] != b'\n' {
+                begin -= 1;
+            }
+            let line = chunk[begin..end].trim_ascii();
+            end = begin.saturating_sub(1);
+
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(needle) = required_substring
+                && !contains_bytes(line, needle)
+            {
+                continue;
+            }
+
+            let value: Value = match serde_json::from_slice(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if let Some(ts) = value.get("timestamp").and_then(|v| v.as_str()) {
+                return Ok(Some(ts.to_string()));
+            }
+        }
+
+        // Keep the partial first line for the next iteration.
+        if let Some(first_nl) = chunk.iter().position(|b| *b == b'\n') {
+            carry = chunk[..first_nl].to_vec();
+        } else {
+            carry = chunk;
+        }
+
+        pos = start;
+    }
+
+    Ok(None)
 }
 
 fn path_matches_current_dir(session_cwd: &str, current_dir: &Path) -> bool {
@@ -407,6 +833,8 @@ fn sort_by_updated_desc(vec: &mut [SessionSummary]) {
 mod tests {
     use super::*;
 
+    use pretty_assertions::assert_eq;
+
     #[test]
     fn session_cwd_parent_of_current_dir_matches() {
         let base = std::env::current_dir().expect("cwd");
@@ -452,5 +880,53 @@ mod tests {
         let (ts, uuid) = parse_timestamp_and_uuid(name).expect("should parse");
         assert_eq!(ts, "2025-12-20T16-01-02");
         assert_eq!(uuid, "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    #[tokio::test]
+    async fn summarize_session_tracks_rounds_and_last_response() {
+        let dir = std::env::temp_dir().join(format!("codex-helper-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create tmp dir");
+        let path =
+            dir.join("rollout-2025-12-22T00-00-00-00000000-0000-0000-0000-000000000000.jsonl");
+        let cwd = dir.join("project");
+        std::fs::create_dir_all(&cwd).expect("create cwd dir");
+        let cwd_str = cwd.to_str().expect("cwd utf8");
+
+        let meta_line = format!(
+            r#"{{"timestamp":"2025-12-22T00:00:00.000Z","type":"session_meta","payload":{{"id":"sid-1","cwd":"{cwd_str}","timestamp":"2025-12-22T00:00:00.000Z"}}}}"#
+        );
+        let lines = [
+            meta_line.as_str(),
+            r#"{"timestamp":"2025-12-22T00:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#,
+            r#"{"timestamp":"2025-12-22T00:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}"#,
+            r#"{"timestamp":"2025-12-22T00:00:03.000Z","type":"event_msg","payload":{"type":"user_message","message":"next"}}"#,
+            r#"{"timestamp":"2025-12-22T00:00:04.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, lines).expect("write session file");
+
+        let summary = summarize_session_for_current_dir(&path, &cwd)
+            .await
+            .expect("summarize ok")
+            .expect("some summary");
+
+        assert_eq!(
+            summary.user_turns, 2,
+            "should count user_message events as user turns"
+        );
+        assert_eq!(
+            summary.assistant_turns, 2,
+            "should count assistant response_item messages"
+        );
+        assert_eq!(summary.rounds, 2, "rounds should match assistant turns");
+        assert_eq!(
+            summary.last_response_at.as_deref(),
+            Some("2025-12-22T00:00:04.000Z")
+        );
+        assert_eq!(
+            summary.updated_at.as_deref(),
+            Some("2025-12-22T00:00:04.000Z"),
+            "updated_at should prefer last_response_at"
+        );
     }
 }

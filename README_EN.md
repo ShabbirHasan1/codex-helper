@@ -1,6 +1,6 @@
 # codex-helper (Codex CLI Local Helper / Proxy)
 
-> Put Codex / Claude Code behind a small local “bumper”:  
+> Put Codex behind a small local “bumper”:  
 > centralize all your relays / keys / quotas, auto-switch when an upstream is exhausted or failing, and get handy CLI helpers for sessions, filtering, and diagnostics.
 
 > 中文说明: `README.md`
@@ -55,30 +55,12 @@ This will:
 
 - Start a Codex proxy on `127.0.0.1:3211`;
 - Guard and, if needed, rewrite `~/.codex/config.toml` to point Codex at the local proxy (backing up the original config on first run);
+- Automatically retry a small number of times for transient failures (429/5xx/network hiccups) **before any response bytes are streamed to the client** (configurable);
 - If `~/.codex-helper/config.json` is still empty, bootstrap a default upstream from `~/.codex/config.toml` + `auth.json`;
 - If running in an interactive terminal, show a built-in TUI dashboard (disable with `--no-tui`; press `q` to quit);
 - On Ctrl+C, attempt to restore the original Codex config from the backup.
 
 After that, you keep using your usual `codex ...` commands; codex-helper just sits in the middle.
-
-### 3. Optional: switch the default target to Claude (experimental)
-
-By default, commands assume **Codex**. If you primarily use Claude Code, you can flip the default:
-
-```bash
-codex-helper default --claude   # set default target service to Claude (experimental)
-```
-
-After this:
-
-- `codex-helper serve` (without flags) will start a **Claude** proxy on `127.0.0.1:3210`;
-- `codex-helper config list/add/set-active` (without `--codex/--claude`) will operate on Claude configs.
-
-You can always check the current default with:
-
-```bash
-codex-helper default
-```
 
 ---
 
@@ -113,9 +95,7 @@ Example `~/.codex-helper/config.json`:
         ]
       }
     }
-  },
-  "claude": { "active": null, "configs": {} },
-  "default_service": null
+  }
 }
 ```
 
@@ -135,67 +115,51 @@ With this layout:
 
 - Start Codex helper (recommended):
   - `codex-helper` / `ch`
-- Explicit Codex / Claude proxy:
-  - `codex-helper serve` (Codex, default port 3211)
+- Explicit Codex proxy:
+  - `codex-helper serve` (default port 3211)
   - `codex-helper serve --no-tui` (disable the built-in TUI dashboard)
-  - `codex-helper serve --codex`
-  - `codex-helper serve --claude` (Claude, default port 3210)
 
-### Turn Codex / Claude on/off via local proxy
+### Turn Codex on/off via local proxy
 
-- Switch Codex / Claude to the local proxy:
+- Switch Codex to the local proxy:
 
   ```bash
-  codex-helper switch on          # Codex
-  codex-helper switch on --claude # Claude (experimental)
+  codex-helper switch on
   ```
 
 - Restore original configs from backup:
 
   ```bash
   codex-helper switch off
-  codex-helper switch off --claude
   ```
 
 - Inspect current switch status:
 
   ```bash
   codex-helper switch status
-  codex-helper switch status --codex
-  codex-helper switch status --claude
   ```
 
 ### Manage upstream configs (providers / relays)
 
-- List configs (defaults to Codex, can target Claude explicitly):
+- List configs:
 
   ```bash
   codex-helper config list
-  codex-helper config list --claude
   ```
 
 - Add a new config:
 
   ```bash
-  # Codex
   codex-helper config add openai-main \
     --base-url https://api.openai.com/v1 \
     --auth-token-env OPENAI_API_KEY \
     --alias "Main OpenAI quota"
-
-  # Claude (experimental)
-  codex-helper config add claude-main \
-    --base-url https://api.anthropic.com/v1 \
-    --auth-token-env ANTHROPIC_AUTH_TOKEN \
-    --alias "Claude main quota" \
-    --claude
   ```
 
 - Set the active config:
 
   ```bash
   codex-helper config set-active openai-main
-  codex-helper config set-active claude-main --claude
   ```
 
 ### Sessions, usage, diagnostics
@@ -265,6 +229,8 @@ codex-helper session list   # list recent sessions for this project
 codex-helper session last   # show last session + a codex resume command
 ```
 
+`session list` now includes the conversation rounds (`rounds`) and the last update timestamp (`last_update`, which prefers the last assistant response time when available).
+
 You can also query sessions for any directory without cd:
 
 ```bash
@@ -285,6 +251,7 @@ Most users do not need to touch these. If you want deeper customization, these f
 - Usage providers: `~/.codex-helper/usage_providers.json`
 - Request logs: `~/.codex-helper/logs/requests.jsonl`
 - Detailed debug logs (optional): `~/.codex-helper/logs/requests_debug.jsonl` (only created when `http_debug` split is enabled)
+- Session stats cache (auto-generated): `~/.codex-helper/cache/session_stats.json` (speeds up `session list/search` rounds/timestamps; invalidated by session file `mtime+size`—delete this file to force a full rescan if needed)
 
 Codex official files:
 
@@ -413,11 +380,11 @@ Sensitive headers are redacted automatically (e.g. `Authorization`/`Cookie`). If
 
 ### Upstream retries (default 2 attempts)
 
-Some upstream failures are transient (network hiccups, 502/503/504/524, or Cloudflare/WAF-like HTML challenge pages). codex-helper can perform a small number of retries **before any response bytes are streamed to the client**, and will try to switch to a different upstream when possible.
+Some upstream failures are transient (network hiccups, 429 rate limits, 502/503/504/524, or Cloudflare/WAF-like HTML challenge pages). codex-helper can perform a small number of retries **before any response bytes are streamed to the client**, and will try to switch to a different upstream when possible.
 
 - Global defaults live under the `retry` block in `~/.codex-helper/config.json`. Environment variables with the same names can override them at runtime (useful for temporary debugging).
 - `CODEX_HELPER_RETRY_MAX_ATTEMPTS=2`: max attempts (default from `retry.max_attempts`; max 8; set to 1 to disable)
-- `CODEX_HELPER_RETRY_ON_STATUS=502,503,504,524`: retry on these status codes (supports ranges like `500-599`)
+- `CODEX_HELPER_RETRY_ON_STATUS=429,502,503,504,524`: retry on these status codes (supports ranges like `500-599`; if upstream returns `Retry-After`, codex-helper will prefer that backoff)
 - `CODEX_HELPER_RETRY_ON_CLASS=upstream_transport_error,cloudflare_timeout,cloudflare_challenge`: retry on these error classes
 - `CODEX_HELPER_RETRY_BACKOFF_MS=200` / `CODEX_HELPER_RETRY_BACKOFF_MAX_MS=2000` / `CODEX_HELPER_RETRY_JITTER_MS=100`: retry backoff (ms)
 - `CODEX_HELPER_RETRY_CLOUDFLARE_CHALLENGE_COOLDOWN_SECS=300` / `CODEX_HELPER_RETRY_CLOUDFLARE_TIMEOUT_COOLDOWN_SECS=60` / `CODEX_HELPER_RETRY_TRANSPORT_COOLDOWN_SECS=30`: upstream cooldown penalties (seconds)
@@ -431,7 +398,7 @@ Example config (`~/.codex-helper/config.json`):
     "backoff_ms": 200,
     "backoff_max_ms": 2000,
     "jitter_ms": 100,
-    "on_status": "502,503,504,524",
+    "on_status": "429,502,503,504,524",
     "on_class": ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challenge"],
     "cloudflare_challenge_cooldown_secs": 300,
     "cloudflare_timeout_cooldown_secs": 60,
@@ -454,11 +421,11 @@ Note: retries may replay **non-idempotent POST requests** (potential double-bill
 
 ## Relationship to cli_proxy and cc-switch
 
-- [cli_proxy](https://github.com/guojinpeng/cli_proxy): a multi-service daemon + Web UI with a broader scope (Codex, Claude, etc.) and centralized monitoring.
+- [cli_proxy](https://github.com/guojinpeng/cli_proxy): a multi-service daemon + Web UI with centralized monitoring.
 - [cc-switch](https://github.com/farion1231/cc-switch): a desktop GUI supplier/MCP manager focused on “manage configs in one place, apply to many clients”.
 
 codex-helper takes inspiration from both, but stays deliberately lightweight:
 
-- focused on Codex CLI (with experimental Claude support);
+- focused on Codex CLI;
 - single binary, no daemon, no Web UI;
 - designed to be a small CLI companion you can run ad hoc, or embed into your own scripts and tooling.

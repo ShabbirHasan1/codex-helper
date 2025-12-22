@@ -25,6 +25,12 @@ pub struct HttpWarnOptions {
     pub max_body_bytes: usize,
 }
 
+pub fn should_log_request_body_preview() -> bool {
+    // Default OFF: request bodies can be large and often contain sensitive data.
+    // Enable explicitly when debugging request payload issues.
+    env_bool_default("CODEX_HELPER_HTTP_LOG_REQUEST_BODY", false)
+}
+
 fn env_bool(key: &str) -> bool {
     let Ok(v) = std::env::var(key) else {
         return false;

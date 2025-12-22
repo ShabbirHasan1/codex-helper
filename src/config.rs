@@ -121,7 +121,7 @@ impl Default for RetryConfig {
             backoff_ms: 200,
             backoff_max_ms: 2_000,
             jitter_ms: 100,
-            on_status: "502,503,504,524".to_string(),
+            on_status: "429,502,503,504,524".to_string(),
             on_class: vec![
                 "upstream_transport_error".to_string(),
                 "cloudflare_timeout".to_string(),
@@ -353,7 +353,7 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("Codex config root must be table"))?;
 
-    let provider_id = table
+    let current_provider_id = table
         .get("model_provider")
         .and_then(|v| v.as_str())
         .unwrap_or("openai")
@@ -365,17 +365,17 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
         .cloned()
         .unwrap_or_default();
 
-    let provider_table = providers_table.get(&provider_id);
-    let requires_openai_auth = provider_table
-        .and_then(|t| t.get("requires_openai_auth"))
-        .and_then(|v| v.as_bool())
-        // Codex 内置 openai provider 默认为 requires_openai_auth=true；
-        // 其他 provider 若未显式声明，则默认为 false（从 env_key 读 key）。
-        .unwrap_or(provider_id == "openai");
+    let auth_json_path = codex_auth_path();
+    let auth_json: Option<JsonValue> = match read_file_if_exists(&auth_json_path)? {
+        Some(s) if !s.trim().is_empty() => serde_json::from_str(&s).ok(),
+        _ => None,
+    };
+    let inferred_env_key = infer_env_key_from_auth_json(&auth_json).map(|(k, _)| k);
 
     // 如当前 provider 看起来是本地 codex-helper 代理且没有备份（或备份无效），
     // 则无法安全推导原始上游，直接报错，避免将代理指向自身。
-    if provider_id == "codex_proxy" && !backup_path.exists() {
+    if current_provider_id == "codex_proxy" && !backup_path.exists() {
+        let provider_table = providers_table.get(&current_provider_id);
         let is_local_helper = provider_table
             .and_then(|t| t.get("base_url"))
             .and_then(|v| v.as_str())
@@ -389,83 +389,168 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
         }
     }
 
-    let base_url = provider_table
-        .and_then(|t| t.get("base_url"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("https://api.openai.com/v1")
-        .to_string();
+    let mut imported_any = false;
+    let mut imported_active = false;
 
-    let env_key = provider_table
-        .and_then(|t| t.get("env_key"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    // Import all providers from [model_providers.*] as switchable configs.
+    for (provider_id, provider_val) in providers_table.iter() {
+        let Some(provider_table) = provider_val.as_table() else {
+            continue;
+        };
 
-    let auth_json_path = codex_auth_path();
-    let auth_json: Option<JsonValue> = match read_file_if_exists(&auth_json_path)? {
-        Some(s) if !s.trim().is_empty() => serde_json::from_str(&s).ok(),
-        _ => None,
-    };
+        let requires_openai_auth = provider_table
+            .get("requires_openai_auth")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(provider_id == "openai");
 
-    // 认证语义（参考 Codex CLI）：
-    // - requires_openai_auth=true：由 Codex CLI 自身管理 auth（API key / ChatGPT tokens），
-    //   本地代理应优先透传客户端 Authorization，而不是强行从 env_key 推导。
-    // - requires_openai_auth=false：通常从 env_key 环境变量读取第三方 provider key。
-    let (auth_token, auth_token_env) = if requires_openai_auth {
-        info!(
-            "model_provider '{}' requires_openai_auth=true，将透传客户端 Authorization（不从 env_key 推导 token）",
-            provider_id
-        );
-        (None, None)
-    } else {
-        // 安全默认：不在 ~/.codex-helper/config.json 中落盘保存密钥；
-        // 只记录 env_key（环境变量名）并在运行时解析。
-        //
-        // 若当前 provider 未声明 env_key，则在 ~/.codex/auth.json 中尝试推断唯一的 `*_API_KEY` 字段作为后备。
-        let mut effective_env_key = env_key.clone();
-        if effective_env_key.is_none()
-            && let Some((inferred_key, _)) = infer_env_key_from_auth_json(&auth_json)
+        let base_url_opt = provider_table
+            .get("base_url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                if provider_id == "openai" {
+                    Some("https://api.openai.com/v1".to_string())
+                } else {
+                    None
+                }
+            });
+
+        let base_url = match base_url_opt {
+            Some(u) if !u.trim().is_empty() => u,
+            _ => {
+                if provider_id == &current_provider_id {
+                    anyhow::bail!(
+                        "当前 model_provider '{}' 缺少 base_url，无法自动推导 Codex 上游",
+                        provider_id
+                    );
+                }
+                warn!(
+                    "skip model_provider '{}' because base_url is missing",
+                    provider_id
+                );
+                continue;
+            }
+        };
+
+        if provider_id == "codex_proxy"
+            && (base_url.contains("127.0.0.1") || base_url.contains("localhost"))
         {
-            info!(
-                "当前 model_provider 未声明 env_key，已从 ~/.codex/auth.json 自动推断为 `{}`",
-                inferred_key
-            );
-            effective_env_key = Some(inferred_key);
+            if provider_id == &current_provider_id && !backup_path.exists() {
+                anyhow::bail!(
+                    "检测到 ~/.codex/config.toml 的当前 model_provider 指向本地代理 codex-helper，且未找到备份配置；\
+无法自动推导原始 Codex 上游。请先恢复 ~/.codex/config.toml 后重试，或在 ~/.codex-helper/config.json 中手动添加 codex 上游配置。"
+                );
+            }
+            warn!("skip model_provider 'codex_proxy' to avoid self-forwarding loop");
+            continue;
         }
-        if effective_env_key.is_none() {
-            anyhow::bail!(
-                "当前 model_provider 未声明 env_key，且无法从 ~/.codex/auth.json 推断唯一的 `*_API_KEY` 字段；请为该 provider 配置 env_key"
-            );
+
+        let env_key = provider_table
+            .get("env_key")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.trim().is_empty());
+
+        let (auth_token, auth_token_env) = if requires_openai_auth {
+            (None, None)
+        } else {
+            let effective_env_key = env_key.clone().or_else(|| inferred_env_key.clone());
+            if effective_env_key.is_none() {
+                if provider_id == &current_provider_id {
+                    anyhow::bail!(
+                        "当前 model_provider 未声明 env_key，且无法从 ~/.codex/auth.json 推断唯一的 `*_API_KEY` 字段；请为该 provider 配置 env_key"
+                    );
+                }
+                warn!(
+                    "skip model_provider '{}' because env_key is missing and auth.json can't infer a unique *_API_KEY",
+                    provider_id
+                );
+                continue;
+            }
+            (None, effective_env_key)
+        };
+
+        let alias = provider_table
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.trim().is_empty())
+            .filter(|s| s != provider_id);
+
+        let mut tags = HashMap::new();
+        tags.insert("source".into(), "codex-config".into());
+        tags.insert("provider_id".into(), provider_id.to_string());
+        tags.insert(
+            "requires_openai_auth".into(),
+            requires_openai_auth.to_string(),
+        );
+
+        let upstream = UpstreamConfig {
+            base_url: base_url.clone(),
+            auth: UpstreamAuth {
+                auth_token,
+                auth_token_env,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags,
+        };
+
+        let service = ServiceConfig {
+            name: provider_id.to_string(),
+            alias,
+            upstreams: vec![upstream],
+        };
+
+        cfg.codex.configs.insert(provider_id.to_string(), service);
+        imported_any = true;
+        if provider_id == &current_provider_id {
+            imported_active = true;
         }
-        (None, effective_env_key)
-    };
+    }
 
-    let mut tags = HashMap::new();
-    tags.insert("source".into(), "codex-config".into());
-    tags.insert("provider_id".into(), provider_id.clone());
-    tags.insert(
-        "requires_openai_auth".into(),
-        requires_openai_auth.to_string(),
-    );
+    // Ensure openai exists as a safe default (even if model_providers table is absent).
+    if !cfg.codex.configs.contains_key("openai") {
+        let mut tags = HashMap::new();
+        tags.insert("source".into(), "codex-config".into());
+        tags.insert("provider_id".into(), "openai".into());
+        tags.insert("requires_openai_auth".into(), "true".into());
+        cfg.codex.configs.insert(
+            "openai".into(),
+            ServiceConfig {
+                name: "openai".into(),
+                alias: None,
+                upstreams: vec![UpstreamConfig {
+                    base_url: "https://api.openai.com/v1".into(),
+                    auth: UpstreamAuth {
+                        auth_token: None,
+                        auth_token_env: None,
+                        api_key: None,
+                        api_key_env: None,
+                    },
+                    tags,
+                }],
+            },
+        );
+        imported_any = true;
+    }
 
-    let upstream = UpstreamConfig {
-        base_url,
-        auth: UpstreamAuth {
-            auth_token,
-            auth_token_env,
-            api_key: None,
-            api_key_env: None,
-        },
-        tags,
-    };
+    if !imported_any {
+        anyhow::bail!("未能从 ~/.codex/config.toml 推导出任何可用的 Codex 上游配置");
+    }
 
-    let service = ServiceConfig {
-        name: provider_id.clone(),
-        alias: None,
-        upstreams: vec![upstream],
-    };
-
-    cfg.codex.configs.insert(provider_id.clone(), service);
-    cfg.codex.active = Some(provider_id);
+    // Prefer the Codex CLI current provider as active.
+    if imported_active && cfg.codex.configs.contains_key(&current_provider_id) {
+        cfg.codex.active = Some(current_provider_id);
+    } else {
+        cfg.codex.active = cfg
+            .codex
+            .configs
+            .keys()
+            .min()
+            .cloned()
+            .or_else(|| Some("openai".to_string()));
+    }
 
     Ok(())
 }
