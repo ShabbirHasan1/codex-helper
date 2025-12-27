@@ -14,8 +14,10 @@ use crate::logging::{
 use crate::state::ProxyState;
 use crate::usage_providers;
 
-use super::{HttpDebugBase, ProxyService, SelectedUpstream, header_map_to_entries, warn_http_debug};
 use super::classify::classify_upstream_response;
+use super::{
+    HttpDebugBase, ProxyService, SelectedUpstream, header_map_to_entries, warn_http_debug,
+};
 
 #[derive(Default)]
 struct StreamUsageState {
@@ -77,7 +79,10 @@ impl StreamFinalize {
             .get("content-type")
             .and_then(|v| v.to_str().ok());
         let (client_body, upstream_request_body) = if for_warn {
-            (b.client_body_warn.clone(), b.upstream_request_body_warn.clone())
+            (
+                b.client_body_warn.clone(),
+                b.upstream_request_body_warn.clone(),
+            )
         } else {
             (
                 b.client_body_debug.clone(),
@@ -193,27 +198,31 @@ pub(super) fn build_sse_success_response(
     lb: LoadBalancer,
     selected: SelectedUpstream,
     resp: reqwest::Response,
-    status: StatusCode,
-    resp_headers: HeaderMap,
-    resp_headers_filtered: HeaderMap,
-    start: Instant,
-    started_at_ms: u64,
-    upstream_start: Instant,
-    upstream_headers_ms: u64,
-    request_body_len: usize,
-    upstream_request_body_len: usize,
-    debug_base: Option<HttpDebugBase>,
-    retry: Option<RetryInfo>,
-    session_id: Option<String>,
-    cwd: Option<String>,
-    effective_effort: Option<String>,
-    request_id: u64,
-    is_user_turn: bool,
-    is_codex_service: bool,
-    transport_cooldown_secs: u64,
-    method: Method,
-    path: String,
+    meta: SseSuccessMeta,
 ) -> Response<Body> {
+    let SseSuccessMeta {
+        status,
+        resp_headers,
+        resp_headers_filtered,
+        start,
+        started_at_ms,
+        upstream_start,
+        upstream_headers_ms,
+        request_body_len,
+        upstream_request_body_len,
+        debug_base,
+        retry,
+        session_id,
+        cwd,
+        effective_effort,
+        request_id,
+        is_user_turn,
+        is_codex_service,
+        transport_cooldown_secs,
+        method,
+        path,
+    } = meta;
+
     if is_user_turn {
         let provider_id = selected
             .upstream
@@ -277,8 +286,13 @@ pub(super) fn build_sse_success_response(
             let config_name = selected.config_name.clone();
             let upstream_index = selected.index;
             async move {
-                usage_providers::poll_for_codex_upstream(cfg, lb_states, &config_name, upstream_index)
-                    .await;
+                usage_providers::poll_for_codex_upstream(
+                    cfg,
+                    lb_states,
+                    &config_name,
+                    upstream_index,
+                )
+                .await;
             }
         });
     }
@@ -386,3 +400,25 @@ pub(super) fn build_sse_success_response(
     builder.body(body).unwrap()
 }
 
+pub(super) struct SseSuccessMeta {
+    pub(super) status: StatusCode,
+    pub(super) resp_headers: HeaderMap,
+    pub(super) resp_headers_filtered: HeaderMap,
+    pub(super) start: Instant,
+    pub(super) started_at_ms: u64,
+    pub(super) upstream_start: Instant,
+    pub(super) upstream_headers_ms: u64,
+    pub(super) request_body_len: usize,
+    pub(super) upstream_request_body_len: usize,
+    pub(super) debug_base: Option<HttpDebugBase>,
+    pub(super) retry: Option<RetryInfo>,
+    pub(super) session_id: Option<String>,
+    pub(super) cwd: Option<String>,
+    pub(super) effective_effort: Option<String>,
+    pub(super) request_id: u64,
+    pub(super) is_user_turn: bool,
+    pub(super) is_codex_service: bool,
+    pub(super) transport_cooldown_secs: u64,
+    pub(super) method: Method,
+    pub(super) path: String,
+}

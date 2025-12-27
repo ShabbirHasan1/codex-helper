@@ -391,7 +391,7 @@ fn parse_session_meta(value: &Value) -> Option<SessionMetaInfo> {
     })
 }
 
-fn user_message_text<'a>(value: &'a Value) -> Option<&'a str> {
+fn user_message_text(value: &Value) -> Option<&str> {
     let obj = value.as_object()?;
     let type_str = obj.get("type")?.as_str()?;
     if type_str != "event_msg" {
@@ -902,7 +902,7 @@ mod tests {
             }
         })
         .to_string();
-        let lines = vec![
+        let lines = [
             meta_line,
             r#"{"timestamp":"2025-12-22T00:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#.to_string(),
             r#"{"timestamp":"2025-12-22T00:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}"#.to_string(),

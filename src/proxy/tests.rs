@@ -7,12 +7,12 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use reqwest::Client;
 
-use crate::config::{ProxyConfig, RetryConfig, ServiceConfig, ServiceConfigManager, UpstreamAuth, UpstreamConfig};
+use crate::config::{
+    ProxyConfig, RetryConfig, ServiceConfig, ServiceConfigManager, UpstreamAuth, UpstreamConfig,
+};
 use crate::proxy::ProxyService;
 
-fn spawn_axum_server(
-    app: axum::Router,
-) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+fn spawn_axum_server(app: axum::Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     listener.set_nonblocking(true).expect("nonblocking");
@@ -24,8 +24,10 @@ fn spawn_axum_server(
 }
 
 fn make_proxy_config(upstreams: Vec<UpstreamConfig>, retry: RetryConfig) -> ProxyConfig {
-    let mut mgr = ServiceConfigManager::default();
-    mgr.active = Some("test".to_string());
+    let mut mgr = ServiceConfigManager {
+        active: Some("test".to_string()),
+        ..Default::default()
+    };
     mgr.configs.insert(
         "test".to_string(),
         ServiceConfig {
@@ -54,7 +56,10 @@ async fn proxy_failover_retries_502_then_uses_second_upstream() {
         "/v1/responses",
         post(move || async move {
             u1_hits.fetch_add(1, Ordering::SeqCst);
-            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({ "err": "nope" })))
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "err": "nope" })),
+            )
         }),
     );
     let (u1_addr, u1_handle) = spawn_axum_server(upstream1);
@@ -64,7 +69,10 @@ async fn proxy_failover_retries_502_then_uses_second_upstream() {
         "/v1/responses",
         post(move || async move {
             u2_hits.fetch_add(1, Ordering::SeqCst);
-            (StatusCode::OK, Json(serde_json::json!({ "ok": true, "upstream": 2 })))
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "upstream": 2 })),
+            )
         }),
     );
     let (u2_addr, u2_handle) = spawn_axum_server(upstream2);
@@ -157,7 +165,10 @@ async fn proxy_does_not_retry_or_failover_on_400() {
         "/v1/responses",
         post(move || async move {
             u1_hits.fetch_add(1, Ordering::SeqCst);
-            (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "err": "bad request" })))
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "err": "bad request" })),
+            )
         }),
     );
     let (u1_addr, u1_handle) = spawn_axum_server(upstream1);

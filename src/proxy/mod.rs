@@ -36,7 +36,7 @@ use self::retry::{
     backoff_sleep, retry_info_for_chain, retry_options, retry_sleep, should_retry_class,
     should_retry_status,
 };
-use self::stream::build_sse_success_response;
+use self::stream::{SseSuccessMeta, build_sse_success_response};
 
 fn read_json_file(path: &std::path::Path) -> Option<serde_json::Value> {
     let bytes = std::fs::read(path).ok()?;
@@ -1011,26 +1011,28 @@ pub async fn handle_proxy(
                 lb.clone(),
                 selected,
                 resp,
-                status,
-                resp_headers,
-                resp_headers_filtered,
-                start,
-                started_at_ms,
-                upstream_start,
-                upstream_headers_ms,
-                request_body_len,
-                upstream_request_body_len,
-                debug_base,
-                retry,
-                session_id.clone(),
-                cwd.clone(),
-                effective_effort.clone(),
-                request_id,
-                is_user_turn,
-                is_codex_service,
-                retry_opt.transport_cooldown_secs,
-                method.clone(),
-                uri.path().to_string(),
+                SseSuccessMeta {
+                    status,
+                    resp_headers,
+                    resp_headers_filtered,
+                    start,
+                    started_at_ms,
+                    upstream_start,
+                    upstream_headers_ms,
+                    request_body_len,
+                    upstream_request_body_len,
+                    debug_base,
+                    retry,
+                    session_id: session_id.clone(),
+                    cwd: cwd.clone(),
+                    effective_effort: effective_effort.clone(),
+                    request_id,
+                    is_user_turn,
+                    is_codex_service,
+                    transport_cooldown_secs: retry_opt.transport_cooldown_secs,
+                    method: method.clone(),
+                    path: uri.path().to_string(),
+                },
             ));
         } else {
             let bytes = match resp.bytes().await {

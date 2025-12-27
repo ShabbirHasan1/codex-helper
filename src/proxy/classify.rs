@@ -67,4 +67,3 @@ pub(super) fn classify_upstream_response(
 
     (None, None, cf_ray)
 }
-
