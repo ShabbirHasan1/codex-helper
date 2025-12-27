@@ -58,7 +58,7 @@ ch
 - 在修改前检查 `~/.codex/config.toml`，如已指向本地代理且存在备份，会询问是否先恢复原始配置；
 - 必要时修改 `model_provider` 与 `model_providers.codex_proxy`，让 Codex 走本地代理，并只在首次写入备份；
 - 写入 `model_providers.codex_proxy` 时，默认设置 `request_max_retries = 0` 以避免“Codex 重试 + codex-helper 重试”叠加（你也可以在 `~/.codex/config.toml` 中手动覆盖）；
-- 如果 `~/.codex-helper/config.json` 还没初始化，会尝试根据 `~/.codex/config.toml` + `auth.json` 推导一个默认上游；
+- 如果 `~/.codex-helper/config.toml` / `config.json` 还没初始化，会尝试根据 `~/.codex/config.toml` + `auth.json` 推导一个默认上游（首次自动落盘默认生成 TOML）；
 - 用 Ctrl+C 或在 TUI 中按 `q` 退出时，尝试从备份恢复原始 Codex 配置。
 
 从此之后，你继续用原来的 `codex` 命令即可，所有请求会自动经过 codex-helper。
@@ -75,7 +75,7 @@ ch
 
 **关键点：主线路 + 备份线路要放在同一个配置的 `upstreams` 里，而不是拆成两个平级配置。**
 
-示例（`~/.codex-helper/config.json`）：
+示例（JSON 版本；TOML 字段基本一致）：
 
 ```jsonc
 {
@@ -252,19 +252,27 @@ codex-helper session last --path ~/code/my-app
 
 大部分用户只需要前面的命令即可。如果你想做更细粒度的定制，可以关注这几个文件：
 
-- 主配置：`~/.codex-helper/config.json`
+- 主配置：`~/.codex-helper/config.toml`（优先）或 `~/.codex-helper/config.json`（兼容）
 - 请求过滤：`~/.codex-helper/filter.json`
 - 用量提供商：`~/.codex-helper/usage_providers.json`
 - 请求日志：`~/.codex-helper/logs/requests.jsonl`
 - 详细调试日志（可选）：`~/.codex-helper/logs/requests_debug.jsonl`（仅在启用 `http_debug` 拆分时生成）
 - 会话统计缓存（自动生成）：`~/.codex-helper/cache/session_stats.json`（用于加速 `session list/search` 的轮数/时间统计；以 session 文件 `mtime+size` 作为失效条件，如怀疑不准可直接删除该文件强制重建）
 
+如果你希望快速生成一个带注释的 TOML 默认模板：
+
+```bash
+codex-helper config init
+```
+
 Codex 官方文件：
 
 - `~/.codex/auth.json`：由 `codex login` 维护，codex-helper 只读取，不写入；
 - `~/.codex/config.toml`：由 Codex CLI 维护，codex-helper 仅在 `switch on/off` 时有限修改。
 
-### `config.json` 简要结构
+### 配置文件简要结构（TOML/JSON）
+
+codex-helper 支持 `config.toml` 与 `config.json`，且字段结构基本一致；如同时存在，以 `config.toml` 为准。
 
 ```jsonc
 {
@@ -367,14 +375,14 @@ Codex 官方文件：
 
 有些上游错误（例如网络抖动、429 限流、502/503/504/524、或看起来像 Cloudflare/WAF 的拦截页）可能是瞬态的；codex-helper 支持在**未开始向客户端输出响应**前进行有限次数的重试，并尽量切换到其它 upstream。
 
-- `~/.codex-helper/config.json` 的 `retry` 段可以设置全局默认值；同名环境变量可在运行时覆盖（用于临时调试）。
+- 主配置（`~/.codex-helper/config.toml` / `config.json`）的 `retry` 段可以设置全局默认值；同名环境变量可在运行时覆盖（用于临时调试）。
 - `CODEX_HELPER_RETRY_MAX_ATTEMPTS=2`：最大尝试次数（默认来自配置的 `retry.max_attempts`，最大 8；如需关闭重试请设为 1）
 - `CODEX_HELPER_RETRY_ON_STATUS=429,502,503,504,524`：遇到这些状态码时允许重试（支持 `a-b` 区间，例如 `500-599`；若上游返回 `Retry-After`，会优先按其等待时间退避）
 - `CODEX_HELPER_RETRY_ON_CLASS=upstream_transport_error,cloudflare_timeout,cloudflare_challenge`：按错误分类允许重试
 - `CODEX_HELPER_RETRY_BACKOFF_MS=200` / `CODEX_HELPER_RETRY_BACKOFF_MAX_MS=2000` / `CODEX_HELPER_RETRY_JITTER_MS=100`：重试退避参数（毫秒）
 - `CODEX_HELPER_RETRY_CLOUDFLARE_CHALLENGE_COOLDOWN_SECS=300` / `CODEX_HELPER_RETRY_CLOUDFLARE_TIMEOUT_COOLDOWN_SECS=60` / `CODEX_HELPER_RETRY_TRANSPORT_COOLDOWN_SECS=30`：对触发重试的 upstream 施加冷却（秒）
 
-配置示例（`~/.codex-helper/config.json`）：
+配置示例（JSON 版本）：
 
 ```jsonc
 {
