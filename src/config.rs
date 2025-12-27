@@ -284,35 +284,47 @@ version = 1
 # default_service = "codex"
 # default_service = "claude"
 
-# --- Retry policy (proxy-side) ---
+# --- Common: upstream configs (accounts / API keys) ---
 #
-# Controls codex-helper's own retries before returning a response to Codex.
-# Note: if you also enable Codex retries, you may get "double retry".
+# Most users only need to edit this section.
 #
-[retry]
-# Max attempts per request (including the first attempt). Set to 1 to disable retries.
-max_attempts = 2
-
-# Base backoff between attempts (milliseconds).
-backoff_ms = 200
-# Maximum backoff cap (milliseconds).
-backoff_max_ms = 2000
-# Random jitter added to backoff (milliseconds).
-jitter_ms = 100
-
-# HTTP status codes/ranges that are retryable (string form).
-# Examples: "429,502,503,504,524" or "429,500-599".
-on_status = "429,502,503,504,524"
-
-# Retryable error classes (from codex-helper classification).
-on_class = ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challenge"]
-
-# Cooldown penalties (seconds) applied to an upstream after certain failure classes.
-cloudflare_challenge_cooldown_secs = 300
-cloudflare_timeout_cooldown_secs = 60
-transport_cooldown_secs = 30
-
+# Notes:
+# - Prefer env-based secrets (`*_env`) instead of writing tokens to disk.
+# - For multi-upstream failover, put multiple `[[...upstreams]]` under the same config.
+#
+# [codex]
+# active = "codex-main"
+#
+# [codex.configs.codex-main]
+# name = "codex-main"
+# alias = "primary+backup"
+#
+# # Primary upstream
+# [[codex.configs.codex-main.upstreams]]
+# base_url = "https://api.openai.com/v1"
+# [codex.configs.codex-main.upstreams.auth]
+# auth_token_env = "OPENAI_API_KEY"
+# # or: api_key_env = "OPENAI_API_KEY"
+# # (not recommended) auth_token = "sk-..."
+# [codex.configs.codex-main.upstreams.tags]
+# provider_id = "openai"
+#
+# # Backup upstream
+# [[codex.configs.codex-main.upstreams]]
+# base_url = "https://your-backup-provider.example/v1"
+# [codex.configs.codex-main.upstreams.auth]
+# auth_token_env = "BACKUP_API_KEY"
+# [codex.configs.codex-main.upstreams.tags]
+# provider_id = "backup"
+#
+# Claude configs share the same structure under [claude].
+#
+# ---
+#
 # --- Notify integration (Codex `notify` hook) ---
+#
+# This is optional and disabled by default.
+# It is designed for multi-Codex workflows: low-noise, duration-based, and rate-limited.
 #
 # To enable:
 # 1) In Codex config `~/.codex/config.toml`:
@@ -351,32 +363,35 @@ recent_endpoint_timeout_ms = 500
 enabled = false
 # command = ["python", "my_hook.py"]
 
-# --- Upstream configs ---
+# ---
 #
-# You can configure multiple upstreams per config for failover.
+# --- Retry policy (proxy-side) ---
 #
-# [codex]
-# active = "codex-main"
+# Controls codex-helper's own retries before returning a response to Codex.
+# Note: if you also enable Codex retries, you may get "double retry".
 #
-# [codex.configs.codex-main]
-# name = "codex-main"
-# alias = "primary+backup"
-#
-# [[codex.configs.codex-main.upstreams]]
-# base_url = "https://api.openai.com/v1"
-# [codex.configs.codex-main.upstreams.auth]
-# auth_token_env = "OPENAI_API_KEY"
-# [codex.configs.codex-main.upstreams.tags]
-# provider_id = "openai"
-#
-# [[codex.configs.codex-main.upstreams]]
-# base_url = "https://your-backup-provider.example/v1"
-# [codex.configs.codex-main.upstreams.auth]
-# api_key_env = "BACKUP_API_KEY"
-# [codex.configs.codex-main.upstreams.tags]
-# provider_id = "backup"
-#
-# Claude configs share the same structure under [claude].
+[retry]
+# Max attempts per request (including the first attempt). Set to 1 to disable retries.
+max_attempts = 2
+
+# Base backoff between attempts (milliseconds).
+backoff_ms = 200
+# Maximum backoff cap (milliseconds).
+backoff_max_ms = 2000
+# Random jitter added to backoff (milliseconds).
+jitter_ms = 100
+
+# HTTP status codes/ranges that are retryable (string form).
+# Examples: "429,502,503,504,524" or "429,500-599".
+on_status = "429,502,503,504,524"
+
+# Retryable error classes (from codex-helper classification).
+on_class = ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challenge"]
+
+# Cooldown penalties (seconds) applied to an upstream after certain failure classes.
+cloudflare_challenge_cooldown_secs = 300
+cloudflare_timeout_cooldown_secs = 60
+transport_cooldown_secs = 30
 "#;
 
 pub async fn init_config_toml(force: bool) -> Result<PathBuf> {
