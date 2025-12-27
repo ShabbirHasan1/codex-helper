@@ -4,11 +4,17 @@ All notable changes to this project will be documented in this file.
 > Starting from `0.5.0`, changelog entries are bilingual: **Chinese first, then English**.
 
 ## [0.5.0] - 2025-12-27
+### 亮点 / Highlights
+- Codex 任务结束通知：当 Codex 的一轮对话执行完成时，可以由 codex-helper 触发系统通知（默认关闭），并支持合并/限流以避免刷屏；也可配置自定义 Hook（exec，stdin 接收聚合 JSON）。  
+  Codex turn-complete notifications: when a Codex turn completes, codex-helper can trigger a system notification (disabled by default) with merge/rate-limit to avoid spam; or call a custom hook (exec, aggregated JSON via stdin).
+- 配置体验升级：新增 `~/.codex-helper/config.toml`（优先使用）并提供 `codex-helper config init` 生成带注释的模板；继续兼容 `config.json`。  
+  Better config UX: add `~/.codex-helper/config.toml` (preferred) and `codex-helper config init` to generate a commented template; keep `config.json` compatibility.
+
 ### 新增 / Added
-- 增加 Codex `notify` 集成：支持基于耗时的通知（D）与合并/限流（A），默认最多每分钟 1 条，并支持可选的外部回调（exec，stdin 接收聚合 JSON），系统通知默认关闭。  
-  Add Codex `notify` integration: duration-based filtering (D) + merge/rate-limit (A) with at most 1 notification per minute by default, optional exec callback (aggregated JSON via stdin), and system notifications disabled by default.
-- 支持双格式配置：`~/.codex-helper/config.toml`（优先）与 `config.json`（兼容）；提供 `codex-helper config init` 生成带注释的 TOML 模板；首次自动落盘默认生成 TOML。  
-  Support dual config formats: `~/.codex-helper/config.toml` (preferred) and `config.json` (compatible); add `codex-helper config init` to generate a commented TOML template; default to TOML on first write.
+- Codex `notify` 集成：支持系统通知与自定义 Hook（exec，stdin 接收聚合 JSON），并提供默认的合并/限流策略以减少噪音（系统通知默认关闭）。  
+  Codex `notify` integration: system notifications and a custom hook (exec, aggregated JSON via stdin), with default merge/rate-limit policy to reduce noise (system notifications disabled by default).
+- 双格式配置：新增 `~/.codex-helper/config.toml`（优先）与注释模板生成命令 `codex-helper config init`；继续兼容 `config.json`；首次自动落盘默认生成 TOML。  
+  Dual config formats: add `~/.codex-helper/config.toml` (preferred) and a commented template generator `codex-helper config init`; keep `config.json` compatibility; default to TOML on first write.
 
 ### 变更 / Changed
 - 文档更新：说明 notify 的配置方式与 TOML 配置的优先级。  
