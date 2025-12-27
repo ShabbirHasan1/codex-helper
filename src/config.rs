@@ -268,11 +268,15 @@ const CONFIG_TOML_TEMPLATE: &str = r#"# codex-helper config.toml
 # - If `config.toml` exists, it takes precedence over `config.json`.
 # - Otherwise `config.json` is used (backward-compatible default).
 #
-# This template focuses on discoverability: it includes commented examples.
+# This template focuses on discoverability: it includes commented examples and per-field notes.
 #
 # Paths:
 # - Linux/macOS: ~/.codex-helper/config.toml
 # - Windows:     %USERPROFILE%\.codex-helper\config.toml
+#
+# Tip:
+# - Generate/overwrite this template: `codex-helper config init [--force]`
+# - Fresh installs default to writing TOML on first write.
 
 version = 1
 
@@ -280,16 +284,45 @@ version = 1
 # default_service = "codex"
 # default_service = "claude"
 
+# --- Retry policy (proxy-side) ---
+#
+# Controls codex-helper's own retries before returning a response to Codex.
+# Note: if you also enable Codex retries, you may get "double retry".
+#
+[retry]
+# Max attempts per request (including the first attempt). Set to 1 to disable retries.
+max_attempts = 2
+
+# Base backoff between attempts (milliseconds).
+backoff_ms = 200
+# Maximum backoff cap (milliseconds).
+backoff_max_ms = 2000
+# Random jitter added to backoff (milliseconds).
+jitter_ms = 100
+
+# HTTP status codes/ranges that are retryable (string form).
+# Examples: "429,502,503,504,524" or "429,500-599".
+on_status = "429,502,503,504,524"
+
+# Retryable error classes (from codex-helper classification).
+on_class = ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challenge"]
+
+# Cooldown penalties (seconds) applied to an upstream after certain failure classes.
+cloudflare_challenge_cooldown_secs = 300
+cloudflare_timeout_cooldown_secs = 60
+transport_cooldown_secs = 30
+
 # --- Notify integration (Codex `notify` hook) ---
 #
 # To enable:
-# 1) In ~/.codex/config.toml:
+# 1) In Codex config `~/.codex/config.toml`:
 #      notify = ["codex-helper", "notify", "codex"]
 # 2) Here:
 #      notify.enabled = true
 #      notify.system.enabled = true
 #
 [notify]
+# Master switch for notify processing (both system and exec sinks).
 enabled = false
 
 [notify.system]
@@ -307,7 +340,8 @@ merge_window_ms = 10000
 global_cooldown_ms = 60000
 per_thread_cooldown_ms = 180000
 
-# How far back to look in proxy /__codex_helper/status/recent (milliseconds)
+# How far back to look in proxy /__codex_helper/status/recent (milliseconds).
+# codex-helper matches Codex "thread-id" to proxy FinishedRequest.session_id.
 recent_search_window_ms = 300000
 # HTTP timeout for the proxy recent endpoint (milliseconds)
 recent_endpoint_timeout_ms = 500
@@ -341,6 +375,8 @@ enabled = false
 # api_key_env = "BACKUP_API_KEY"
 # [codex.configs.codex-main.upstreams.tags]
 # provider_id = "backup"
+#
+# Claude configs share the same structure under [claude].
 "#;
 
 pub async fn init_config_toml(force: bool) -> Result<PathBuf> {

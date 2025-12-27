@@ -1,6 +1,19 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
+> Starting from `0.5.0`, changelog entries are bilingual: **Chinese first, then English**.
+
+## [0.5.0] - 2025-12-27
+### 新增 / Added
+- 增加 Codex `notify` 集成：支持基于耗时的通知（D）与合并/限流（A），默认最多每分钟 1 条，并支持可选的外部回调（exec，stdin 接收聚合 JSON），系统通知默认关闭。  
+  Add Codex `notify` integration: duration-based filtering (D) + merge/rate-limit (A) with at most 1 notification per minute by default, optional exec callback (aggregated JSON via stdin), and system notifications disabled by default.
+- 支持双格式配置：`~/.codex-helper/config.toml`（优先）与 `config.json`（兼容）；提供 `codex-helper config init` 生成带注释的 TOML 模板；首次自动落盘默认生成 TOML。  
+  Support dual config formats: `~/.codex-helper/config.toml` (preferred) and `config.json` (compatible); add `codex-helper config init` to generate a commented TOML template; default to TOML on first write.
+
+### 变更 / Changed
+- 文档更新：说明 notify 的配置方式与 TOML 配置的优先级。  
+  Docs update: describe notify configuration and TOML precedence.
+
 ## [0.4.1] - 2025-12-27
 ### Changed
 - `switch on` now sets `model_providers.codex_proxy.request_max_retries = 0` by default to avoid double-retry (Codex retries + codex-helper retries), while preserving any user-defined value.
