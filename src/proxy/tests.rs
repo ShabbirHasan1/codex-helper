@@ -42,6 +42,7 @@ fn make_proxy_config(upstreams: Vec<UpstreamConfig>, retry: RetryConfig) -> Prox
         codex: mgr,
         claude: ServiceConfigManager::default(),
         retry,
+        notify: Default::default(),
         default_service: None,
     }
 }

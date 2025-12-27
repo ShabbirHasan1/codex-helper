@@ -65,6 +65,50 @@ After that, you keep using your usual `codex ...` commands; codex-helper just si
 
 ---
 
+## Optional: Codex `notify` integration (rate-limited, duration-based)
+
+Codex can invoke an external program for `"agent-turn-complete"` events via the `notify` setting in `~/.codex/config.toml`. codex-helper can act as that program and apply a low-noise policy:
+
+- **D (duration-based)**: only notify when the corresponding proxied request has `duration_ms >= min_duration_ms`;
+- **A (aggregation/rate-limit)**: merge bursts and enforce **at most 1 notification per minute** by default.
+
+### 1) Configure Codex to call codex-helper
+
+Add to `~/.codex/config.toml`:
+
+```toml
+notify = ["codex-helper", "notify", "codex"]
+```
+
+> This is independent from `tui.notifications`. You can use both.
+
+### 2) Enable notifications in `~/.codex-helper/config.json` (default: off)
+
+Add (or edit) the `notify` section:
+
+```jsonc
+{
+  "notify": {
+    "enabled": true,
+    "system": { "enabled": true },
+    "policy": {
+      "min_duration_ms": 60000,
+      "global_cooldown_ms": 60000,
+      "merge_window_ms": 10000,
+      "per_thread_cooldown_ms": 180000
+    }
+  }
+}
+```
+
+Notes:
+
+- codex-helper matches the Codex `"thread-id"` to proxy `FinishedRequest.session_id` and uses `/__codex_helper/status/recent` to compute `duration_ms`. If Codex is not routed through codex-helper, duration matching is unavailable and notifications are skipped.
+- System notifications are implemented on Windows (toast via `powershell.exe`) and macOS (via `osascript`). Other platforms currently fall back to printing a short line.
+- Optional callback sink: set `notify.exec.enabled = true` and `notify.exec.command = ["your-program", "arg1"]` to receive aggregated JSON on stdin.
+
+---
+
 ## Common configuration: multi-upstream failover
 
 The most common and powerful way to use codex-helper is to let it **fail over between multiple upstreams automatically** when one is failing or out of quota.

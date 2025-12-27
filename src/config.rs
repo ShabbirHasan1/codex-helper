@@ -134,6 +134,63 @@ impl Default for RetryConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotifyPolicyConfig {
+    /// Only notify when proxy duration_ms is >= this threshold.
+    pub min_duration_ms: u64,
+    /// At most one notification per global_cooldown_ms.
+    pub global_cooldown_ms: u64,
+    /// Events within this window will be merged into one notification.
+    pub merge_window_ms: u64,
+    /// Suppress notifications for the same thread-id within this cooldown.
+    pub per_thread_cooldown_ms: u64,
+    /// How far back to look in proxy recent-finished list when matching a thread-id.
+    pub recent_search_window_ms: u64,
+    /// Timeout for calling proxy `status/recent` endpoint.
+    pub recent_endpoint_timeout_ms: u64,
+}
+
+impl Default for NotifyPolicyConfig {
+    fn default() -> Self {
+        Self {
+            min_duration_ms: 60_000,
+            global_cooldown_ms: 60_000,
+            merge_window_ms: 10_000,
+            per_thread_cooldown_ms: 180_000,
+            recent_search_window_ms: 5 * 60_000,
+            recent_endpoint_timeout_ms: 500,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NotifySystemConfig {
+    /// Whether to show system notifications (toasts). Default: false.
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NotifyExecConfig {
+    /// Enable executing an external command for each aggregated notification.
+    pub enabled: bool,
+    /// Command to execute; the aggregated JSON is written to stdin.
+    /// Example: ["python", "my_script.py"].
+    #[serde(default)]
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NotifyConfig {
+    /// Whether notify processing is enabled at all (system toast and exec are both disabled by default).
+    pub enabled: bool,
+    #[serde(default)]
+    pub policy: NotifyPolicyConfig,
+    #[serde(default)]
+    pub system: NotifySystemConfig,
+    #[serde(default)]
+    pub exec: NotifyExecConfig,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProxyConfig {
     /// Optional config schema version for future migrations
@@ -148,6 +205,9 @@ pub struct ProxyConfig {
     /// Global retry policy (can be overridden by env vars)
     #[serde(default)]
     pub retry: RetryConfig,
+    /// Notify integration settings (used by `codex-helper notify ...`).
+    #[serde(default)]
+    pub notify: NotifyConfig,
     /// 默认目标服务（用于 CLI 默认选择 codex/claude）
     #[serde(default)]
     pub default_service: Option<ServiceKind>,

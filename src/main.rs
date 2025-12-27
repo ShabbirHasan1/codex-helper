@@ -4,6 +4,7 @@ mod config;
 mod filter;
 mod lb;
 mod logging;
+mod notify;
 mod proxy;
 mod sessions;
 mod state;
@@ -140,6 +141,11 @@ enum Command {
         #[command(subcommand)]
         cmd: UsageCommand,
     },
+    /// Handle Codex notifications (for Codex `notify` hook)
+    Notify {
+        #[command(subcommand)]
+        cmd: NotifyCommand,
+    },
     /// Get or set the default target service (Codex/Claude) used by other commands
     Default {
         /// Set default to Codex
@@ -149,6 +155,25 @@ enum Command {
         #[arg(long)]
         claude: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum NotifyCommand {
+    /// Process a Codex `notify` payload and show a system notification (best-effort)
+    Codex {
+        /// Codex passes the notification JSON as a single argument; for manual testing you can omit
+        /// it and pipe JSON via stdin.
+        notification_json: Option<String>,
+        /// Do not show a system notification; only update notify state / run exec callbacks.
+        #[arg(long)]
+        no_toast: bool,
+        /// Force enable system notification for this invocation (overrides config).
+        #[arg(long)]
+        toast: bool,
+    },
+    /// Internal: flush pending merged events and emit notifications (spawned in background).
+    #[command(hide = true)]
+    FlushCodex,
 }
 
 #[derive(Subcommand, Debug)]
@@ -372,6 +397,17 @@ async fn real_main() -> CliResult<()> {
         }
         Command::Usage { cmd } => {
             commands::usage::handle_usage_cmd(cmd).await?;
+            return Ok(());
+        }
+        Command::Notify { cmd } => {
+            match cmd {
+                NotifyCommand::Codex {
+                    notification_json,
+                    no_toast,
+                    toast,
+                } => notify::handle_codex_notify(notification_json, no_toast, toast).await?,
+                NotifyCommand::FlushCodex => notify::handle_codex_flush().await?,
+            }
             return Ok(());
         }
         Command::Serve {
