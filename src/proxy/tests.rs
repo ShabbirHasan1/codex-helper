@@ -105,6 +105,8 @@ async fn proxy_failover_retries_502_then_uses_second_upstream() {
                     t.insert("provider_id".to_string(), "u1".to_string());
                     t
                 },
+                supported_models: HashMap::new(),
+                model_mapping: HashMap::new(),
             },
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u2_addr),
@@ -119,6 +121,8 @@ async fn proxy_failover_retries_502_then_uses_second_upstream() {
                     t.insert("provider_id".to_string(), "u2".to_string());
                     t
                 },
+                supported_models: HashMap::new(),
+                model_mapping: HashMap::new(),
             },
         ],
         retry,
@@ -207,6 +211,8 @@ async fn proxy_does_not_retry_or_failover_on_400() {
                     api_key_env: None,
                 },
                 tags: HashMap::new(),
+                supported_models: HashMap::new(),
+                model_mapping: HashMap::new(),
             },
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u2_addr),
@@ -217,6 +223,8 @@ async fn proxy_does_not_retry_or_failover_on_400() {
                     api_key_env: None,
                 },
                 tags: HashMap::new(),
+                supported_models: HashMap::new(),
+                model_mapping: HashMap::new(),
             },
         ],
         retry,
@@ -247,4 +255,197 @@ async fn proxy_does_not_retry_or_failover_on_400() {
     proxy_handle.abort();
     u1_handle.abort();
     u2_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_skips_upstreams_that_do_not_support_model() {
+    let upstream1_hits = Arc::new(AtomicUsize::new(0));
+    let upstream2_hits = Arc::new(AtomicUsize::new(0));
+
+    let u1_hits = upstream1_hits.clone();
+    let upstream1 = axum::Router::new().route(
+        "/v1/responses",
+        post(move || async move {
+            u1_hits.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "err": "should not hit" })),
+            )
+        }),
+    );
+    let (u1_addr, u1_handle) = spawn_axum_server(upstream1);
+
+    let u2_hits = upstream2_hits.clone();
+    let upstream2 = axum::Router::new().route(
+        "/v1/responses",
+        post(move || async move {
+            u2_hits.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "upstream": 2 })),
+            )
+        }),
+    );
+    let (u2_addr, u2_handle) = spawn_axum_server(upstream2);
+
+    let proxy_client = Client::new();
+    let retry = RetryConfig {
+        max_attempts: 1,
+        backoff_ms: 0,
+        backoff_max_ms: 0,
+        jitter_ms: 0,
+        on_status: "502".to_string(),
+        on_class: Vec::new(),
+        cloudflare_challenge_cooldown_secs: 0,
+        cloudflare_timeout_cooldown_secs: 0,
+        transport_cooldown_secs: 0,
+    };
+    let cfg = make_proxy_config(
+        vec![
+            UpstreamConfig {
+                base_url: format!("http://{}/v1", u1_addr),
+                auth: UpstreamAuth {
+                    auth_token: None,
+                    auth_token_env: None,
+                    api_key: None,
+                    api_key_env: None,
+                },
+                tags: HashMap::new(),
+                supported_models: {
+                    let mut m = HashMap::new();
+                    m.insert("other-*".to_string(), true);
+                    m
+                },
+                model_mapping: HashMap::new(),
+            },
+            UpstreamConfig {
+                base_url: format!("http://{}/v1", u2_addr),
+                auth: UpstreamAuth {
+                    auth_token: None,
+                    auth_token_env: None,
+                    api_key: None,
+                    api_key_env: None,
+                },
+                tags: HashMap::new(),
+                supported_models: {
+                    let mut m = HashMap::new();
+                    m.insert("gpt-*".to_string(), true);
+                    m
+                },
+                model_mapping: HashMap::new(),
+            },
+        ],
+        retry,
+    );
+
+    let proxy = ProxyService::new(
+        proxy_client,
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/v1/responses", proxy_addr))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-4","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(upstream1_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(upstream2_hits.load(Ordering::SeqCst), 1);
+
+    proxy_handle.abort();
+    u1_handle.abort();
+    u2_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_applies_model_mapping_to_request_body() {
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+
+    let hits = upstream_hits.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move |body: axum::body::Bytes| async move {
+            hits.fetch_add(1, Ordering::SeqCst);
+            let v: serde_json::Value =
+                serde_json::from_slice(&body).expect("json body should parse");
+            let model = v.get("model").and_then(|m| m.as_str()).unwrap_or("");
+            if model == "anthropic/claude-sonnet-4" {
+                (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+            } else {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "model": model })),
+                )
+            }
+        }),
+    );
+    let (u_addr, u_handle) = spawn_axum_server(upstream);
+
+    let proxy_client = Client::new();
+    let retry = RetryConfig {
+        max_attempts: 1,
+        backoff_ms: 0,
+        backoff_max_ms: 0,
+        jitter_ms: 0,
+        on_status: "502".to_string(),
+        on_class: Vec::new(),
+        cloudflare_challenge_cooldown_secs: 0,
+        cloudflare_timeout_cooldown_secs: 0,
+        transport_cooldown_secs: 0,
+    };
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{}/v1", u_addr),
+            auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: None,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: HashMap::new(),
+            supported_models: {
+                let mut m = HashMap::new();
+                m.insert("anthropic/claude-*".to_string(), true);
+                m
+            },
+            model_mapping: {
+                let mut m = HashMap::new();
+                m.insert("claude-*".to_string(), "anthropic/claude-*".to_string());
+                m
+            },
+        }],
+        retry,
+    );
+
+    let proxy = ProxyService::new(
+        proxy_client,
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/v1/responses", proxy_addr))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-sonnet-4","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+    proxy_handle.abort();
+    u_handle.abort();
 }

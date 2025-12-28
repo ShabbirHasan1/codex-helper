@@ -3,6 +3,21 @@ All notable changes to this project will be documented in this file.
 
 > Starting from `0.5.0`, changelog entries are bilingual: **Chinese first, then English**.
 
+## [0.10.0] - Unreleased
+### 亮点 / Highlights
+- TUI 全面升级：用 `ratatui v0.30` 重写内置面板，信息层级更清晰、布局更有“呼吸感”，并为后续功能页扩展预留了结构化模块。  
+  TUI upgrade: rewrite the built-in dashboard with `ratatui v0.30`, with clearer information hierarchy, more breathable layout, and a modular structure for future features.
+- 模型白名单与映射（支持通配符）：为每个上游增加 `supported_models` / `model_mapping`（兼容 JSON `supportedModels` / `modelMapping`），代理会自动过滤不支持的上游并在转发前重写 `model` 字段。  
+  Model allowlist + mapping (wildcards supported): add per-upstream `supported_models` / `model_mapping` (JSON compatible via `supportedModels` / `modelMapping`); the proxy skips incompatible upstreams and rewrites `model` before forwarding.
+
+### 新增 / Added
+- 启动时模型路由配置告警：提示未配置白名单/映射、仅配置映射未配置白名单、以及“映射目标不在白名单”等高风险配置。  
+  Startup warnings for model routing config: warns about missing allowlist/mapping, mapping without allowlist, and invalid mapping targets.
+
+### 测试 / Tests
+- 新增用例覆盖：按模型过滤上游、以及请求体 `model` 自动映射。  
+  Add tests for: skipping upstreams by model support, and request body `model` mapping.
+
 ## [0.5.0] - 2025-12-27
 ### 亮点 / Highlights
 - Codex 任务结束通知：当 Codex 的一轮对话执行完成时，可以由 codex-helper 触发系统通知（默认关闭），并支持合并/限流以避免刷屏；也可配置自定义 Hook（exec，stdin 接收聚合 JSON）。  

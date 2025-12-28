@@ -104,6 +104,8 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                     api_key_env,
                 },
                 tags: Default::default(),
+                supported_models: Default::default(),
+                model_mapping: Default::default(),
             };
             let service_cfg = ServiceConfig {
                 name: name.clone(),

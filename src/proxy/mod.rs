@@ -27,6 +27,7 @@ use crate::logging::{
     http_warn_options, log_request_with_debug, make_body_preview, should_include_http_debug,
     should_include_http_warn, should_log_request_body_preview,
 };
+use crate::model_routing;
 use crate::state::{ActiveRequest, FinishedRequest, ProxyState};
 use crate::usage::extract_usage_from_bytes;
 use crate::usage_providers;
@@ -451,6 +452,15 @@ fn apply_reasoning_effort_override(body: &[u8], effort: &str) -> Option<Vec<u8>>
     serde_json::to_vec(&v).ok()
 }
 
+fn apply_model_override(body: &[u8], model: &str) -> Option<Vec<u8>> {
+    let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    v.as_object_mut()?.insert(
+        "model".to_string(),
+        serde_json::Value::String(model.to_string()),
+    );
+    serde_json::to_vec(&v).ok()
+}
+
 #[instrument(skip_all, fields(service = %proxy.service_name))]
 pub async fn handle_proxy(
     proxy: ProxyService,
@@ -623,10 +633,7 @@ pub async fn handle_proxy(
         raw_body.clone()
     };
     let request_model = extract_model_from_request_body(body_for_upstream.as_ref());
-
-    let filtered_body = proxy.filter.apply_bytes(body_for_upstream);
     let request_body_len = raw_body.len();
-    let upstream_request_body_len = filtered_body.len();
 
     let debug_opt = http_debug_options();
     let warn_opt = http_warn_options();
@@ -646,26 +653,8 @@ pub async fn handle_proxy(
     } else {
         None
     };
-    let upstream_request_body_debug = if request_body_previews && debug_max > 0 {
-        Some(make_body_preview(
-            &filtered_body,
-            client_content_type,
-            debug_max,
-        ))
-    } else {
-        None
-    };
     let client_body_warn = if request_body_previews && warn_max > 0 {
         Some(make_body_preview(&raw_body, client_content_type, warn_max))
-    } else {
-        None
-    };
-    let upstream_request_body_warn = if request_body_previews && warn_max > 0 {
-        Some(make_body_preview(
-            &filtered_body,
-            client_content_type,
-            warn_max,
-        ))
     } else {
         None
     };
@@ -695,9 +684,42 @@ pub async fn handle_proxy(
             break;
         }
 
-        let Some(selected) = lb.select_upstream_avoiding(&avoid) else {
+        let selected = loop {
+            let upstream_total = lb.service.upstreams.len();
+            if upstream_total > 0 && avoid.len() >= upstream_total {
+                break None;
+            }
+
+            let Some(selected) = lb.select_upstream_avoiding(&avoid) else {
+                break None;
+            };
+
+            if let Some(ref requested_model) = request_model {
+                let supported = model_routing::is_model_supported(
+                    &selected.upstream.supported_models,
+                    &selected.upstream.model_mapping,
+                    requested_model,
+                );
+                if !supported {
+                    upstream_chain.push(format!(
+                        "{} (idx={}) skipped_unsupported_model={}",
+                        selected.upstream.base_url, selected.index, requested_model
+                    ));
+                    avoid.insert(selected.index);
+                    continue;
+                }
+            }
+
+            break Some(selected);
+        };
+
+        let Some(selected) = selected else {
             let dur = start.elapsed().as_millis() as u64;
-            let status = StatusCode::BAD_GATEWAY;
+            let status = if request_model.is_some() {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
             log_request_with_debug(
                 proxy.service_name,
                 method.as_str(),
@@ -717,7 +739,51 @@ pub async fn handle_proxy(
                 .state
                 .finish_request(request_id, status.as_u16(), dur, started_at_ms + dur, None)
                 .await;
+            if let Some(model) = request_model.as_deref() {
+                return Err((
+                    status,
+                    format!("no upstreams in current config support requested model '{model}'"),
+                ));
+            }
             return Err((status, "no upstreams in current config".to_string()));
+        };
+
+        let mut model_note = "-".to_string();
+        let mut body_for_selected = body_for_upstream.clone();
+        if let Some(ref requested_model) = request_model {
+            let effective_model =
+                model_routing::effective_model(&selected.upstream.model_mapping, requested_model);
+            if effective_model != *requested_model {
+                if let Some(modified) =
+                    apply_model_override(body_for_upstream.as_ref(), effective_model.as_str())
+                {
+                    body_for_selected = Bytes::from(modified);
+                }
+                model_note = format!("{requested_model}->{effective_model}");
+            } else {
+                model_note = requested_model.clone();
+            }
+        }
+
+        let filtered_body = proxy.filter.apply_bytes(body_for_selected);
+        let upstream_request_body_len = filtered_body.len();
+        let upstream_request_body_debug = if request_body_previews && debug_max > 0 {
+            Some(make_body_preview(
+                &filtered_body,
+                client_content_type,
+                debug_max,
+            ))
+        } else {
+            None
+        };
+        let upstream_request_body_warn = if request_body_previews && warn_max > 0 {
+            Some(make_body_preview(
+                &filtered_body,
+                client_content_type,
+                warn_max,
+            ))
+        } else {
+            None
         };
 
         let target_url = match proxy.build_target(&selected, &uri) {
@@ -726,8 +792,11 @@ pub async fn handle_proxy(
                 lb.record_result(selected.index, false);
                 let err_str = e.to_string();
                 upstream_chain.push(format!(
-                    "{} (idx={}) target_build_error={}",
-                    selected.upstream.base_url, selected.index, err_str
+                    "{} (idx={}) target_build_error={} model={}",
+                    selected.upstream.base_url,
+                    selected.index,
+                    err_str,
+                    model_note.as_str()
                 ));
                 avoid.insert(selected.index);
 
@@ -880,8 +949,11 @@ pub async fn handle_proxy(
                 lb.record_result(selected.index, false);
                 let err_str = e.to_string();
                 upstream_chain.push(format!(
-                    "{} (idx={}) transport_error={}",
-                    selected.upstream.base_url, selected.index, err_str
+                    "{} (idx={}) transport_error={} model={}",
+                    selected.upstream.base_url,
+                    selected.index,
+                    err_str,
+                    model_note.as_str()
                 ));
                 let can_retry = attempt_index + 1 < retry_opt.max_attempts
                     && should_retry_class(&retry_opt, Some("upstream_transport_error"));
@@ -999,10 +1071,11 @@ pub async fn handle_proxy(
         if is_stream && success {
             lb.record_result(selected.index, true);
             upstream_chain.push(format!(
-                "{} (idx={}) status={}",
+                "{} (idx={}) status={} model={}",
                 selected.upstream.base_url,
                 selected.index,
-                status.as_u16()
+                status.as_u16(),
+                model_note.as_str()
             ));
             let retry = retry_info_for_chain(&upstream_chain);
 
@@ -1041,8 +1114,11 @@ pub async fn handle_proxy(
                     lb.record_result(selected.index, false);
                     let err_str = e.to_string();
                     upstream_chain.push(format!(
-                        "{} (idx={}) body_read_error={}",
-                        selected.upstream.base_url, selected.index, err_str
+                        "{} (idx={}) body_read_error={} model={}",
+                        selected.upstream.base_url,
+                        selected.index,
+                        err_str,
+                        model_note.as_str()
                     ));
                     let can_retry = attempt_index + 1 < retry_opt.max_attempts
                         && should_retry_class(&retry_opt, Some("upstream_transport_error"));
@@ -1118,11 +1194,12 @@ pub async fn handle_proxy(
                 classify_upstream_response(status_code, &resp_headers, bytes.as_ref());
 
             upstream_chain.push(format!(
-                "{} (idx={}) status={} class={}",
+                "{} (idx={}) status={} class={} model={}",
                 selected.upstream.base_url,
                 selected.index,
                 status_code,
-                cls.as_deref().unwrap_or("-")
+                cls.as_deref().unwrap_or("-"),
+                model_note.as_str()
             ));
 
             let retryable = !status.is_success()
@@ -1333,7 +1410,7 @@ pub async fn handle_proxy(
             .clone();
         Some(HttpDebugLog {
             request_body_len: Some(request_body_len),
-            upstream_request_body_len: Some(upstream_request_body_len),
+            upstream_request_body_len: None,
             upstream_headers_ms: None,
             upstream_first_chunk_ms: None,
             upstream_body_read_ms: None,
@@ -1346,7 +1423,7 @@ pub async fn handle_proxy(
             upstream_request_headers: Vec::new(),
             auth_resolution: None,
             client_body: client_body_warn.clone(),
-            upstream_request_body: upstream_request_body_warn.clone(),
+            upstream_request_body: None,
             upstream_response_headers: None,
             upstream_response_body: None,
             upstream_error: Some(format!(

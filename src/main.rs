@@ -4,6 +4,7 @@ mod config;
 mod filter;
 mod lb;
 mod logging;
+mod model_routing;
 mod notify;
 mod proxy;
 mod sessions;
@@ -25,7 +26,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::{
     ServiceKind, claude_settings_backup_path, claude_settings_path, codex_backup_config_path,
-    codex_config_path, load_config, load_or_bootstrap_for_service,
+    codex_config_path, load_config, load_or_bootstrap_for_service, model_routing_warnings,
 };
 use crate::proxy::{ProxyService, router as proxy_router};
 
@@ -655,6 +656,15 @@ async fn run_server(service_name: &'static str, port: u16, enable_tui: bool) -> 
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let warnings = model_routing_warnings(&cfg, service_name);
+    if !warnings.is_empty() {
+        tracing::warn!("======== Model routing config warnings ========");
+        for w in warnings {
+            tracing::warn!("{}", w);
+        }
+        tracing::warn!("==============================================");
+    }
 
     {
         let shutdown_tx = shutdown_tx.clone();

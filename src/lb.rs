@@ -249,6 +249,8 @@ mod tests {
                         api_key_env: None,
                     },
                     tags: HashMap::new(),
+                    supported_models: HashMap::new(),
+                    model_mapping: HashMap::new(),
                 })
                 .collect(),
         }

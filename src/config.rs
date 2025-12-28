@@ -67,6 +67,88 @@ pub struct UpstreamConfig {
     /// Optional free-form metadata, e.g. region / label
     #[serde(default)]
     pub tags: HashMap<String, String>,
+    /// Optional model whitelist for this upstream (exact or wildcard patterns like `gpt-*`).
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        alias = "supportedModels"
+    )]
+    pub supported_models: HashMap<String, bool>,
+    /// Optional model mapping: external model name -> upstream-specific model name (supports wildcards).
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        alias = "modelMapping"
+    )]
+    pub model_mapping: HashMap<String, String>,
+}
+
+pub fn model_routing_warnings(cfg: &ProxyConfig, service_name: &str) -> Vec<String> {
+    use crate::model_routing::match_wildcard;
+
+    fn validate_upstream(name: &str, upstream: &UpstreamConfig) -> Vec<String> {
+        let mut out = Vec::new();
+
+        if upstream.supported_models.is_empty() && upstream.model_mapping.is_empty() {
+            out.push(format!(
+                "[{name}] 未配置 supported_models 或 model_mapping，将假设支持所有模型（可能导致降级失败）"
+            ));
+            return out;
+        }
+
+        if !upstream.model_mapping.is_empty() && upstream.supported_models.is_empty() {
+            out.push(format!(
+                "[{name}] 配置了 model_mapping 但未配置 supported_models，映射目标将不做校验，请确认目标模型在供应商处可用"
+            ));
+        }
+
+        if upstream.model_mapping.is_empty() || upstream.supported_models.is_empty() {
+            return out;
+        }
+
+        for (external_model, internal_model) in upstream.model_mapping.iter() {
+            if internal_model.contains('*') {
+                continue;
+            }
+            let supported = if upstream
+                .supported_models
+                .get(internal_model)
+                .copied()
+                .unwrap_or(false)
+            {
+                true
+            } else {
+                upstream
+                    .supported_models
+                    .keys()
+                    .any(|p| match_wildcard(p, internal_model))
+            };
+            if !supported {
+                out.push(format!(
+                    "[{name}] 模型映射无效：'{external_model}' -> '{internal_model}'，目标模型不在 supported_models 中"
+                ));
+            }
+        }
+        out
+    }
+
+    let mgr = match service_name {
+        "claude" => &cfg.claude,
+        "codex" => &cfg.codex,
+        _ => &cfg.codex,
+    };
+
+    let mut warnings = Vec::new();
+    for (cfg_name, svc) in mgr.configs.iter() {
+        for (idx, upstream) in svc.upstreams.iter().enumerate() {
+            let name = format!(
+                "{service_name}:{cfg_name} upstream[{idx}] ({})",
+                upstream.base_url
+            );
+            warnings.extend(validate_upstream(&name, upstream));
+        }
+    }
+    warnings
 }
 
 /// A logical config entry (roughly corresponds to cli_proxy 的一个配置名)
@@ -759,6 +841,8 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
                 api_key_env: None,
             },
             tags,
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
         };
 
         let service = ServiceConfig {
@@ -794,6 +878,8 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
                         api_key_env: None,
                     },
                     tags,
+                    supported_models: HashMap::new(),
+                    model_mapping: HashMap::new(),
                 }],
             },
         );
@@ -906,6 +992,8 @@ fn bootstrap_from_claude(cfg: &mut ProxyConfig) -> Result<()> {
             api_key_env: Some(api_key_env),
         },
         tags,
+        supported_models: HashMap::new(),
+        model_mapping: HashMap::new(),
     };
 
     let service = ServiceConfig {
