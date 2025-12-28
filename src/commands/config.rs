@@ -110,6 +110,8 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
             let service_cfg = ServiceConfig {
                 name: name.clone(),
                 alias,
+                enabled: true,
+                level: 1,
                 upstreams: vec![upstream],
             };
 

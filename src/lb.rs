@@ -238,6 +238,8 @@ mod tests {
         ServiceConfig {
             name: name.to_string(),
             alias: None,
+            enabled: true,
+            level: 1,
             upstreams: urls
                 .iter()
                 .map(|u| UpstreamConfig {

@@ -112,7 +112,7 @@ Notes:
 
 The most common and powerful way to use codex-helper is to let it **fail over between multiple upstreams automatically** when one is failing or out of quota.
 
-The key idea: put your primary and backup upstreams **in the same config’s `upstreams` array**, instead of as separate configs.
+The key idea: put your primary and backup upstreams **in the same config’s `upstreams` array**.
 
 Example `~/.codex-helper/config.json`:
 
@@ -125,6 +125,8 @@ Example `~/.codex-helper/config.json`:
       "codex-main": {
         "name": "codex-main",
         "alias": null,
+        "enabled": true,
+        "level": 1,
         "upstreams": [
           {
             "base_url": "https://codex-api.packycode.com/v1",
@@ -150,6 +152,15 @@ With this layout:
   - exceeds the failure threshold (`FAILURE_THRESHOLD` in `src/lb.rs`), or
   - is marked `usage_exhausted = true` by `usage_providers`,
   the LB will prefer the other upstream whenever possible.
+
+### Level-based multi-config failover (optional)
+
+If you prefer to keep upstreams in separate configs, codex-helper also supports **level-based config grouping**:
+
+- Each config has a `level` (1..=10, lower is higher priority).
+- Cross-config routing is opt-in: codex-helper only routes across configs when there are **multiple distinct levels**.
+- Within the same level, the `active` config is preferred.
+- Set `enabled = false` to exclude a config from automatic routing (unless it is the active config).
 
 ---
 
@@ -312,6 +323,8 @@ Codex official files:
       "openai-main": {
         "name": "openai-main",
         "alias": "Main OpenAI quota",
+        "enabled": true,
+        "level": 1,
         "upstreams": [
           {
             "base_url": "https://api.openai.com/v1",
@@ -337,6 +350,8 @@ Key ideas:
 
 - `active`: the name of the currently active config;
 - `configs`: a map of named configs;
+- `level`: priority group for level-based config routing (1..=10, lower is higher priority; defaults to 1);
+- `enabled`: whether the config participates in automatic routing (defaults to true);
 - each `upstream` is one endpoint, ordered by priority (primary → backups).
 
 ### `usage_providers.json`

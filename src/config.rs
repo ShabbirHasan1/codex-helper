@@ -159,8 +159,22 @@ pub struct ServiceConfig {
     /// 可选别名，便于展示/记忆
     #[serde(default)]
     pub alias: Option<String>,
+    /// Whether this config is eligible for automatic routing (defaults to true).
+    #[serde(default = "default_service_config_enabled")]
+    pub enabled: bool,
+    /// Priority group (1..=10, lower is higher priority). Default: 1.
+    #[serde(default = "default_service_config_level")]
+    pub level: u8,
     #[serde(default)]
     pub upstreams: Vec<UpstreamConfig>,
+}
+
+fn default_service_config_enabled() -> bool {
+    true
+}
+
+fn default_service_config_level() -> u8 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -373,6 +387,7 @@ version = 1
 # Notes:
 # - Prefer env-based secrets (`*_env`) instead of writing tokens to disk.
 # - For multi-upstream failover, put multiple `[[...upstreams]]` under the same config.
+# - Optional: set per-config `level` (1..=10) to enable level-based routing across configs (only when multiple distinct levels exist).
 #
 # [codex]
 # active = "codex-main"
@@ -380,6 +395,8 @@ version = 1
 # [codex.configs.codex-main]
 # name = "codex-main"
 # alias = "primary+backup"
+# # enabled = true
+# # level = 1
 #
 # # Primary upstream
 # [[codex.configs.codex-main.upstreams]]
@@ -848,6 +865,8 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
         let service = ServiceConfig {
             name: provider_id.to_string(),
             alias,
+            enabled: true,
+            level: 1,
             upstreams: vec![upstream],
         };
 
@@ -869,6 +888,8 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
             ServiceConfig {
                 name: "openai".into(),
                 alias: None,
+                enabled: true,
+                level: 1,
                 upstreams: vec![UpstreamConfig {
                     base_url: "https://api.openai.com/v1".into(),
                     auth: UpstreamAuth {
@@ -999,6 +1020,8 @@ fn bootstrap_from_claude(cfg: &mut ProxyConfig) -> Result<()> {
     let service = ServiceConfig {
         name: "default".to_string(),
         alias: Some("Claude default".to_string()),
+        enabled: true,
+        level: 1,
         upstreams: vec![upstream],
     };
 

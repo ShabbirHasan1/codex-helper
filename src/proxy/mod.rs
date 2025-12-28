@@ -327,7 +327,7 @@ impl ProxyService {
         }
     }
 
-    async fn effective_config_name(&self, session_id: Option<&str>) -> Option<String> {
+    async fn pinned_config_name(&self, session_id: Option<&str>) -> Option<String> {
         if let Some(sid) = session_id
             && let Some(name) = self.state.get_session_config_override(sid).await
             && !name.trim().is_empty()
@@ -339,24 +339,90 @@ impl ProxyService {
         {
             return Some(name);
         }
-        let mgr = self.service_manager();
-        if let Some(name) = mgr.active.as_deref()
-            && !name.trim().is_empty()
-        {
-            return Some(name.to_string());
-        }
-        mgr.active_config().map(|svc| svc.name.clone())
+        None
     }
 
-    async fn lb_for_request(&self, session_id: Option<&str>) -> Option<LoadBalancer> {
+    async fn lbs_for_request(&self, session_id: Option<&str>) -> Vec<LoadBalancer> {
         let mgr = self.service_manager();
-        let name = self.effective_config_name(session_id).await?;
-        let svc = mgr
+        if let Some(name) = self.pinned_config_name(session_id).await {
+            if let Some(svc) = mgr
+                .configs
+                .get(&name)
+                .or_else(|| mgr.active_config())
+                .cloned()
+            {
+                return vec![LoadBalancer::new(Arc::new(svc), self.lb_states.clone())];
+            }
+            return Vec::new();
+        }
+
+        let active_name = mgr.active.as_deref();
+        let mut configs = mgr
             .configs
-            .get(&name)
-            .or_else(|| mgr.active_config())
-            .cloned()?;
-        Some(LoadBalancer::new(Arc::new(svc), self.lb_states.clone()))
+            .iter()
+            .filter(|(name, svc)| {
+                !svc.upstreams.is_empty()
+                    && (svc.enabled || active_name.is_some_and(|n| n == name.as_str()))
+            })
+            .collect::<Vec<_>>();
+
+        let has_multi_level = {
+            let mut levels = configs
+                .iter()
+                .map(|(_, svc)| svc.level.clamp(1, 10))
+                .collect::<Vec<_>>();
+            levels.sort_unstable();
+            levels.dedup();
+            levels.len() > 1
+        };
+
+        if !has_multi_level {
+            if let Some(name) = active_name
+                && let Some(svc) = mgr.configs.get(name)
+                && !svc.upstreams.is_empty()
+            {
+                return vec![LoadBalancer::new(
+                    Arc::new(svc.clone()),
+                    self.lb_states.clone(),
+                )];
+            }
+
+            if let Some((_, svc)) = configs.iter().min_by_key(|(name, _)| *name) {
+                return vec![LoadBalancer::new(
+                    Arc::new((*svc).clone()),
+                    self.lb_states.clone(),
+                )];
+            }
+
+            if let Some(svc) = mgr.active_config().cloned() {
+                return vec![LoadBalancer::new(Arc::new(svc), self.lb_states.clone())];
+            }
+            return Vec::new();
+        }
+
+        configs.sort_by(|(a_name, a), (b_name, b)| {
+            let a_level = a.level.clamp(1, 10);
+            let b_level = b.level.clamp(1, 10);
+            let a_active = active_name.is_some_and(|n| n == a_name.as_str());
+            let b_active = active_name.is_some_and(|n| n == b_name.as_str());
+            a_level
+                .cmp(&b_level)
+                .then_with(|| b_active.cmp(&a_active))
+                .then_with(|| a_name.cmp(b_name))
+        });
+
+        let lbs = configs
+            .into_iter()
+            .map(|(_, svc)| LoadBalancer::new(Arc::new(svc.clone()), self.lb_states.clone()))
+            .collect::<Vec<_>>();
+        if !lbs.is_empty() {
+            return lbs;
+        }
+
+        if let Some(svc) = mgr.active_config().cloned() {
+            return vec![LoadBalancer::new(Arc::new(svc), self.lb_states.clone())];
+        }
+        Vec::new()
     }
 
     fn build_target(
@@ -480,59 +546,56 @@ pub async fn handle_proxy(
 
     let session_id = extract_session_id(&client_headers);
 
-    let lb = match proxy.lb_for_request(session_id.as_deref()).await {
-        Some(lb) => lb,
-        None => {
-            let dur = start.elapsed().as_millis() as u64;
-            let status = StatusCode::BAD_GATEWAY;
-            let client_headers_entries = client_headers_entries_cache
-                .get_or_init(|| header_map_to_entries(&client_headers))
-                .clone();
-            let http_debug = if should_include_http_warn(status.as_u16()) {
-                Some(HttpDebugLog {
-                    request_body_len: None,
-                    upstream_request_body_len: None,
-                    upstream_headers_ms: None,
-                    upstream_first_chunk_ms: None,
-                    upstream_body_read_ms: None,
-                    upstream_error_class: Some("no_active_upstream_config".to_string()),
-                    upstream_error_hint: Some(
-                        "未找到任何可用的上游配置（active_config 为空或 upstreams 为空）。"
-                            .to_string(),
-                    ),
-                    upstream_cf_ray: None,
-                    client_uri: uri.to_string(),
-                    target_url: "-".to_string(),
-                    client_headers: client_headers_entries,
-                    upstream_request_headers: Vec::new(),
-                    auth_resolution: None,
-                    client_body: None,
-                    upstream_request_body: None,
-                    upstream_response_headers: None,
-                    upstream_response_body: None,
-                    upstream_error: Some("no active upstream config".to_string()),
-                })
-            } else {
-                None
-            };
-            log_request_with_debug(
-                proxy.service_name,
-                method.as_str(),
-                uri.path(),
-                status.as_u16(),
-                dur,
-                "-",
-                "-",
-                session_id.clone(),
-                None,
-                None,
-                None,
-                None,
-                http_debug,
-            );
-            return Err((status, "no active upstream config".to_string()));
-        }
-    };
+    let lbs = proxy.lbs_for_request(session_id.as_deref()).await;
+    if lbs.is_empty() {
+        let dur = start.elapsed().as_millis() as u64;
+        let status = StatusCode::BAD_GATEWAY;
+        let client_headers_entries = client_headers_entries_cache
+            .get_or_init(|| header_map_to_entries(&client_headers))
+            .clone();
+        let http_debug = if should_include_http_warn(status.as_u16()) {
+            Some(HttpDebugLog {
+                request_body_len: None,
+                upstream_request_body_len: None,
+                upstream_headers_ms: None,
+                upstream_first_chunk_ms: None,
+                upstream_body_read_ms: None,
+                upstream_error_class: Some("no_active_upstream_config".to_string()),
+                upstream_error_hint: Some(
+                    "未找到任何可用的上游配置（active_config 为空或 upstreams 为空）。".to_string(),
+                ),
+                upstream_cf_ray: None,
+                client_uri: uri.to_string(),
+                target_url: "-".to_string(),
+                client_headers: client_headers_entries,
+                upstream_request_headers: Vec::new(),
+                auth_resolution: None,
+                client_body: None,
+                upstream_request_body: None,
+                upstream_response_headers: None,
+                upstream_response_body: None,
+                upstream_error: Some("no active upstream config".to_string()),
+            })
+        } else {
+            None
+        };
+        log_request_with_debug(
+            proxy.service_name,
+            method.as_str(),
+            uri.path(),
+            status.as_u16(),
+            dur,
+            "-",
+            "-",
+            session_id.clone(),
+            None,
+            None,
+            None,
+            None,
+            http_debug,
+        );
+        return Err((status, "no active upstream config".to_string()));
+    }
     let client_content_type = client_headers
         .get("content-type")
         .and_then(|v| v.to_str().ok());
@@ -674,46 +737,65 @@ pub async fn handle_proxy(
         .await;
 
     let retry_opt = retry_options(&proxy.config.retry);
-    let mut avoid: HashSet<usize> = HashSet::new();
+    let total_upstreams = lbs
+        .iter()
+        .map(|lb| lb.service.upstreams.len())
+        .sum::<usize>();
+    let mut avoid: HashMap<String, HashSet<usize>> = HashMap::new();
     let mut upstream_chain: Vec<String> = Vec::new();
 
     for attempt_index in 0..retry_opt.max_attempts {
-        let upstream_total = lb.service.upstreams.len();
-        if upstream_total > 0 && avoid.len() >= upstream_total {
-            upstream_chain.push(format!("all_upstreams_avoided total={upstream_total}"));
+        let avoided_total = avoid.values().map(|s| s.len()).sum::<usize>();
+        if total_upstreams > 0 && avoided_total >= total_upstreams {
+            upstream_chain.push(format!("all_upstreams_avoided total={total_upstreams}"));
             break;
         }
 
-        let selected = loop {
-            let upstream_total = lb.service.upstreams.len();
-            if upstream_total > 0 && avoid.len() >= upstream_total {
-                break None;
-            }
-
-            let Some(selected) = lb.select_upstream_avoiding(&avoid) else {
-                break None;
-            };
-
-            if let Some(ref requested_model) = request_model {
-                let supported = model_routing::is_model_supported(
-                    &selected.upstream.supported_models,
-                    &selected.upstream.model_mapping,
-                    requested_model,
-                );
-                if !supported {
-                    upstream_chain.push(format!(
-                        "{} (idx={}) skipped_unsupported_model={}",
-                        selected.upstream.base_url, selected.index, requested_model
-                    ));
-                    avoid.insert(selected.index);
-                    continue;
+        let mut chosen: Option<(LoadBalancer, SelectedUpstream)> = None;
+        for lb in &lbs {
+            let cfg_name = lb.service.name.clone();
+            let avoid_set = avoid.entry(cfg_name.clone()).or_default();
+            loop {
+                let upstream_total = lb.service.upstreams.len();
+                if upstream_total > 0 && avoid_set.len() >= upstream_total {
+                    break;
                 }
+                let next = {
+                    let avoid_ref: &HashSet<usize> = &*avoid_set;
+                    lb.select_upstream_avoiding(avoid_ref)
+                };
+                let Some(selected) = next else {
+                    break;
+                };
+
+                if let Some(ref requested_model) = request_model {
+                    let supported = model_routing::is_model_supported(
+                        &selected.upstream.supported_models,
+                        &selected.upstream.model_mapping,
+                        requested_model,
+                    );
+                    if !supported {
+                        upstream_chain.push(format!(
+                            "{}:{} (idx={}) skipped_unsupported_model={}",
+                            selected.config_name,
+                            selected.upstream.base_url,
+                            selected.index,
+                            requested_model
+                        ));
+                        avoid_set.insert(selected.index);
+                        continue;
+                    }
+                }
+
+                chosen = Some((lb.clone(), selected));
+                break;
             }
+            if chosen.is_some() {
+                break;
+            }
+        }
 
-            break Some(selected);
-        };
-
-        let Some(selected) = selected else {
+        let Some((lb, selected)) = chosen else {
             let dur = start.elapsed().as_millis() as u64;
             let status = if request_model.is_some() {
                 StatusCode::NOT_FOUND
@@ -742,10 +824,10 @@ pub async fn handle_proxy(
             if let Some(model) = request_model.as_deref() {
                 return Err((
                     status,
-                    format!("no upstreams in current config support requested model '{model}'"),
+                    format!("no upstreams support requested model '{model}'"),
                 ));
             }
-            return Err((status, "no upstreams in current config".to_string()));
+            return Err((status, "no upstreams available".to_string()));
         };
 
         let mut model_note = "-".to_string();
@@ -792,13 +874,17 @@ pub async fn handle_proxy(
                 lb.record_result(selected.index, false);
                 let err_str = e.to_string();
                 upstream_chain.push(format!(
-                    "{} (idx={}) target_build_error={} model={}",
+                    "{}:{} (idx={}) target_build_error={} model={}",
+                    selected.config_name,
                     selected.upstream.base_url,
                     selected.index,
                     err_str,
                     model_note.as_str()
                 ));
-                avoid.insert(selected.index);
+                avoid
+                    .entry(selected.config_name.clone())
+                    .or_default()
+                    .insert(selected.index);
 
                 let can_retry = attempt_index + 1 < retry_opt.max_attempts;
                 if can_retry {
@@ -949,7 +1035,8 @@ pub async fn handle_proxy(
                 lb.record_result(selected.index, false);
                 let err_str = e.to_string();
                 upstream_chain.push(format!(
-                    "{} (idx={}) transport_error={} model={}",
+                    "{}:{} (idx={}) transport_error={} model={}",
+                    selected.config_name,
                     selected.upstream.base_url,
                     selected.index,
                     err_str,
@@ -963,7 +1050,10 @@ pub async fn handle_proxy(
                         retry_opt.transport_cooldown_secs,
                         "upstream_transport_error",
                     );
-                    avoid.insert(selected.index);
+                    avoid
+                        .entry(selected.config_name.clone())
+                        .or_default()
+                        .insert(selected.index);
                     backoff_sleep(&retry_opt, attempt_index).await;
                     continue;
                 }
@@ -1114,7 +1204,8 @@ pub async fn handle_proxy(
                     lb.record_result(selected.index, false);
                     let err_str = e.to_string();
                     upstream_chain.push(format!(
-                        "{} (idx={}) body_read_error={} model={}",
+                        "{}:{} (idx={}) body_read_error={} model={}",
+                        selected.config_name,
                         selected.upstream.base_url,
                         selected.index,
                         err_str,
@@ -1128,7 +1219,10 @@ pub async fn handle_proxy(
                             retry_opt.transport_cooldown_secs,
                             "upstream_body_read_error",
                         );
-                        avoid.insert(selected.index);
+                        avoid
+                            .entry(selected.config_name.clone())
+                            .or_default()
+                            .insert(selected.index);
                         backoff_sleep(&retry_opt, attempt_index).await;
                         continue;
                     }
@@ -1235,7 +1329,10 @@ pub async fn handle_proxy(
                     ),
                     _ => {}
                 }
-                avoid.insert(selected.index);
+                avoid
+                    .entry(selected.config_name.clone())
+                    .or_default()
+                    .insert(selected.index);
                 retry_sleep(&retry_opt, attempt_index, &resp_headers).await;
                 continue;
             }
