@@ -45,6 +45,8 @@ All notable changes to this project will be documented in this file.
   TUI i18n (zh/en): first run defaults to system locale (override via `ui.language` or `CODEX_HELPER_TUI_LANG`), and press `L` in the TUI to toggle language and persist it.
 - Stats 一键导出/复制报告：在 Stats 页按 `y` 可把选中项的窗口聚合与最近错误分布导出到 `~/.codex-helper/reports/`，并尝试复制到剪贴板。  
   One-key Stats report: press `y` in Stats to export a report for the selected item into `~/.codex-helper/reports/` and attempt to copy it to clipboard.
+- TUI 可用性指标（5m/1h）：Header 与 Config 详情中展示短窗口成功率、p95 延迟、重试率/attempts、429/5xx 错误计数，便于多中转场景快速判断“当前是否稳定、是否在反复重试”（可用 `CODEX_HELPER_RECENT_FINISHED_MAX` 调整窗口统计的请求保留数量）。  
+  TUI availability metrics (5m/1h): show short-window success rate, p95 latency, retry rate/attempts, and 429/5xx counts in the header and config details for multi-proxy stability checks (tune the sample size via `CODEX_HELPER_RECENT_FINISHED_MAX`).
 - 请求日志增强：`requests.jsonl` 增加 `provider_id` 字段（如 upstream tags 里配置了 `provider_id`），用于更准确的统计与排障。  
   Request log enhancement: add `provider_id` field to `requests.jsonl` (when upstream tags include `provider_id`) for better stats and debugging.
 

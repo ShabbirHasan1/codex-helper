@@ -9,8 +9,8 @@ use ratatui::widgets::{
 };
 
 use super::model::{
-    Palette, ProviderOption, Snapshot, basename, format_age, now_ms, short_sid, shorten,
-    status_style, tokens_short, usage_line,
+    Palette, ProviderOption, Snapshot, basename, compute_window_stats, format_age, now_ms,
+    short_sid, shorten, status_style, tokens_short, usage_line,
 };
 use super::state::UiState;
 use super::types::{EffortChoice, Focus, Overlay, Page, page_index, page_titles};
@@ -141,6 +141,39 @@ fn render_header(
         ),
     ]);
 
+    let last_req = snapshot.recent.first();
+    let last_provider = last_req
+        .and_then(|r| r.provider_id.as_deref())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("-");
+    let last_config = last_req
+        .and_then(|r| r.config_name.as_deref())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("-");
+    let last_attempts = last_req
+        .and_then(|r| r.retry.as_ref())
+        .map(|x| x.attempts)
+        .unwrap_or(1);
+
+    let fmt_ok_pct = |ok: usize, total: usize| -> String {
+        if total == 0 {
+            "-".to_string()
+        } else {
+            format!("{:>2}%", ((ok as f64) * 100.0 / (total as f64)).round())
+        }
+    };
+    let fmt_ms = |ms: Option<u64>| -> String {
+        ms.map(|m| format!("{m}ms"))
+            .unwrap_or_else(|| "-".to_string())
+    };
+    let fmt_attempts = |a: Option<f64>| -> String {
+        a.map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "-".to_string())
+    };
+
+    let s5 = &snapshot.stats_5m;
+    let s1 = &snapshot.stats_1h;
+
     let subtitle = Line::from(vec![
         Span::styled(
             crate::tui::i18n::pick(ui.language, "活跃 ", "active "),
@@ -155,6 +188,58 @@ fn render_header(
         Span::styled(
             recent_err.to_string(),
             Style::default().fg(if recent_err > 0 { p.warn } else { p.muted }),
+        ),
+        Span::raw("   "),
+        Span::styled("5m ", Style::default().fg(p.muted)),
+        Span::styled(
+            fmt_ok_pct(s5.ok_2xx, s5.total),
+            Style::default().fg(if s5.total > 0 && s5.ok_2xx == s5.total {
+                p.good
+            } else {
+                p.muted
+            }),
+        ),
+        Span::raw(" "),
+        Span::styled("p95 ", Style::default().fg(p.muted)),
+        Span::styled(fmt_ms(s5.p95_ms), Style::default().fg(p.muted)),
+        Span::raw(" "),
+        Span::styled("att ", Style::default().fg(p.muted)),
+        Span::styled(fmt_attempts(s5.avg_attempts), Style::default().fg(p.muted)),
+        Span::raw(" "),
+        Span::styled("429 ", Style::default().fg(p.muted)),
+        Span::styled(
+            s5.err_429.to_string(),
+            Style::default().fg(if s5.err_429 > 0 { p.warn } else { p.muted }),
+        ),
+        Span::raw(" "),
+        Span::styled("5xx ", Style::default().fg(p.muted)),
+        Span::styled(
+            s5.err_5xx.to_string(),
+            Style::default().fg(if s5.err_5xx > 0 { p.warn } else { p.muted }),
+        ),
+        Span::raw("   "),
+        Span::styled("1h ", Style::default().fg(p.muted)),
+        Span::styled(
+            fmt_ok_pct(s1.ok_2xx, s1.total),
+            Style::default().fg(p.muted),
+        ),
+        Span::raw(" "),
+        Span::styled("p95 ", Style::default().fg(p.muted)),
+        Span::styled(fmt_ms(s1.p95_ms), Style::default().fg(p.muted)),
+        Span::raw(" "),
+        Span::styled("429 ", Style::default().fg(p.muted)),
+        Span::styled(
+            s1.err_429.to_string(),
+            Style::default().fg(if s1.err_429 > 0 { p.warn } else { p.muted }),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "当前 ", "cur "),
+            Style::default().fg(p.muted),
+        ),
+        Span::styled(
+            format!("{last_provider}/{last_config}×{last_attempts}"),
+            Style::default().fg(p.accent),
         ),
         Span::raw("   "),
         Span::styled(
@@ -1789,6 +1874,35 @@ fn render_config_info_modal(
     lines.push(Line::from(""));
 
     if let Some(cfg) = selected {
+        let now = now_ms();
+
+        let stats_5m_cfg = compute_window_stats(&snapshot.recent, now, 5 * 60_000, |r| {
+            r.config_name.as_deref() == Some(cfg.name.as_str())
+        });
+        let stats_1h_cfg = compute_window_stats(&snapshot.recent, now, 60 * 60_000, |r| {
+            r.config_name.as_deref() == Some(cfg.name.as_str())
+        });
+
+        let fmt_ok_pct = |ok: usize, total: usize| -> String {
+            if total == 0 {
+                "-".to_string()
+            } else {
+                format!("{:>2}%", ((ok as f64) * 100.0 / (total as f64)).round())
+            }
+        };
+        let fmt_ms = |ms: Option<u64>| -> String {
+            ms.map(|m| format!("{m}ms"))
+                .unwrap_or_else(|| "-".to_string())
+        };
+        let fmt_attempts = |a: Option<f64>| -> String {
+            a.map(|v| format!("{v:.1}"))
+                .unwrap_or_else(|| "-".to_string())
+        };
+        let fmt_rate_pct = |r: Option<f64>| -> String {
+            r.map(|v| format!("{:.0}%", v * 100.0))
+                .unwrap_or_else(|| "-".to_string())
+        };
+
         let (enabled_ovr, level_ovr) = snapshot
             .config_meta_overrides
             .get(cfg.name.as_str())
@@ -1844,12 +1958,193 @@ fn render_config_info_modal(
         lines.push(Line::from(""));
 
         lines.push(Line::from(vec![Span::styled(
+            crate::tui::i18n::pick(
+                ui.language,
+                "运行态（可用性/体验）",
+                "Runtime (availability/UX)",
+            ),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )]));
+        lines.push(Line::from(vec![
+            Span::styled("5m ", Style::default().fg(p.muted)),
+            Span::styled(
+                crate::tui::i18n::pick(ui.language, "成功 ", "ok "),
+                Style::default().fg(p.muted),
+            ),
+            Span::styled(
+                fmt_ok_pct(stats_5m_cfg.ok_2xx, stats_5m_cfg.total),
+                Style::default().fg(
+                    if stats_5m_cfg.total > 0 && stats_5m_cfg.ok_2xx == stats_5m_cfg.total {
+                        p.good
+                    } else {
+                        p.muted
+                    },
+                ),
+            ),
+            Span::raw("  "),
+            Span::styled("p95 ", Style::default().fg(p.muted)),
+            Span::styled(fmt_ms(stats_5m_cfg.p95_ms), Style::default().fg(p.muted)),
+            Span::raw("  "),
+            Span::styled("att ", Style::default().fg(p.muted)),
+            Span::styled(
+                fmt_attempts(stats_5m_cfg.avg_attempts),
+                Style::default().fg(p.muted),
+            ),
+            Span::raw("  "),
+            Span::styled("r ", Style::default().fg(p.muted)),
+            Span::styled(
+                fmt_rate_pct(stats_5m_cfg.retry_rate),
+                Style::default().fg(p.muted),
+            ),
+            Span::raw("  "),
+            Span::styled("429 ", Style::default().fg(p.muted)),
+            Span::styled(
+                stats_5m_cfg.err_429.to_string(),
+                Style::default().fg(if stats_5m_cfg.err_429 > 0 {
+                    p.warn
+                } else {
+                    p.muted
+                }),
+            ),
+            Span::raw("  "),
+            Span::styled("5xx ", Style::default().fg(p.muted)),
+            Span::styled(
+                stats_5m_cfg.err_5xx.to_string(),
+                Style::default().fg(if stats_5m_cfg.err_5xx > 0 {
+                    p.warn
+                } else {
+                    p.muted
+                }),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("n={}", stats_5m_cfg.total),
+                Style::default().fg(p.muted),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("1h ", Style::default().fg(p.muted)),
+            Span::styled(
+                crate::tui::i18n::pick(ui.language, "成功 ", "ok "),
+                Style::default().fg(p.muted),
+            ),
+            Span::styled(
+                fmt_ok_pct(stats_1h_cfg.ok_2xx, stats_1h_cfg.total),
+                Style::default().fg(p.muted),
+            ),
+            Span::raw("  "),
+            Span::styled("p95 ", Style::default().fg(p.muted)),
+            Span::styled(fmt_ms(stats_1h_cfg.p95_ms), Style::default().fg(p.muted)),
+            Span::raw("  "),
+            Span::styled("att ", Style::default().fg(p.muted)),
+            Span::styled(
+                fmt_attempts(stats_1h_cfg.avg_attempts),
+                Style::default().fg(p.muted),
+            ),
+            Span::raw("  "),
+            Span::styled("r ", Style::default().fg(p.muted)),
+            Span::styled(
+                fmt_rate_pct(stats_1h_cfg.retry_rate),
+                Style::default().fg(p.muted),
+            ),
+            Span::raw("  "),
+            Span::styled("429 ", Style::default().fg(p.muted)),
+            Span::styled(
+                stats_1h_cfg.err_429.to_string(),
+                Style::default().fg(if stats_1h_cfg.err_429 > 0 {
+                    p.warn
+                } else {
+                    p.muted
+                }),
+            ),
+            Span::raw("  "),
+            Span::styled("5xx ", Style::default().fg(p.muted)),
+            Span::styled(
+                stats_1h_cfg.err_5xx.to_string(),
+                Style::default().fg(if stats_1h_cfg.err_5xx > 0 {
+                    p.warn
+                } else {
+                    p.muted
+                }),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("n={}", stats_1h_cfg.total),
+                Style::default().fg(p.muted),
+            ),
+        ]));
+        if let Some((pid, cnt)) = stats_5m_cfg.top_provider.as_ref() {
+            lines.push(Line::from(vec![
+                Span::styled("5m top ", Style::default().fg(p.muted)),
+                Span::styled(pid.to_string(), Style::default().fg(p.text)),
+                Span::styled(format!("  n={cnt}"), Style::default().fg(p.muted)),
+            ]));
+        }
+        lines.push(Line::from(""));
+
+        lines.push(Line::from(vec![Span::styled(
             crate::tui::i18n::pick(ui.language, "上游（Providers）", "Upstreams (providers)"),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         )]));
 
         let health = snapshot.config_health.get(cfg.name.as_str());
         let lb = snapshot.lb_view.get(cfg.name.as_str());
+        let (rt5_by_upstream, rt1_by_upstream) = {
+            use std::collections::HashMap;
+
+            #[derive(Default)]
+            struct Rt {
+                total: usize,
+                ok: usize,
+                err_429: usize,
+                err_5xx: usize,
+                ok_lat_ms: Vec<u64>,
+                attempts_sum: u64,
+                retry_cnt: u64,
+            }
+
+            fn add(map: &mut HashMap<String, Rt>, r: &crate::state::FinishedRequest) {
+                let Some(url) = r.upstream_base_url.as_deref() else {
+                    return;
+                };
+                if url.trim().is_empty() {
+                    return;
+                };
+                let e = map.entry(url.to_string()).or_default();
+                e.total += 1;
+                let attempts = r.retry.as_ref().map(|x| x.attempts).unwrap_or(1);
+                e.attempts_sum = e.attempts_sum.saturating_add(attempts as u64);
+                if attempts > 1 {
+                    e.retry_cnt = e.retry_cnt.saturating_add(1);
+                }
+                if r.status_code == 429 {
+                    e.err_429 += 1;
+                } else if (500..600).contains(&r.status_code) {
+                    e.err_5xx += 1;
+                }
+                if (200..300).contains(&r.status_code) {
+                    e.ok += 1;
+                    e.ok_lat_ms.push(r.duration_ms);
+                }
+            }
+
+            let mut m5: HashMap<String, Rt> = HashMap::new();
+            let mut m1: HashMap<String, Rt> = HashMap::new();
+            let cutoff_5 = now.saturating_sub(5 * 60_000);
+            let cutoff_1 = now.saturating_sub(60 * 60_000);
+            for r in snapshot.recent.iter() {
+                if r.config_name.as_deref() != Some(cfg.name.as_str()) {
+                    continue;
+                }
+                if r.ended_at_ms >= cutoff_5 {
+                    add(&mut m5, r);
+                }
+                if r.ended_at_ms >= cutoff_1 {
+                    add(&mut m1, r);
+                }
+            }
+            (m5, m1)
+        };
 
         if cfg.upstreams.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -1949,6 +2244,73 @@ fn render_config_info_modal(
                     Span::raw("   "),
                     Span::styled("lb: ", Style::default().fg(p.muted)),
                     Span::styled(lb_text, Style::default().fg(p.muted)),
+                ]));
+
+                let runtime_line = {
+                    fn pct(ok: usize, total: usize) -> String {
+                        if total == 0 {
+                            "-".to_string()
+                        } else {
+                            format!("{:.0}%", (ok as f64) * 100.0 / (total as f64))
+                        }
+                    }
+                    fn p95(mut v: Vec<u64>) -> Option<u64> {
+                        if v.is_empty() {
+                            return None;
+                        }
+                        let n = v.len();
+                        let idx =
+                            ((0.95 * (n.saturating_sub(1) as f64)).ceil() as usize).min(n - 1);
+                        let (_, nth, _) = v.select_nth_unstable(idx);
+                        Some(*nth)
+                    }
+                    fn att(sum: u64, total: usize) -> String {
+                        if total == 0 {
+                            "-".to_string()
+                        } else {
+                            format!("{:.1}", sum as f64 / total as f64)
+                        }
+                    }
+
+                    let rt5 = rt5_by_upstream.get(&up.base_url);
+                    let rt1 = rt1_by_upstream.get(&up.base_url);
+
+                    let s5 = rt5
+                        .map(|x| {
+                            let p95_ms = p95(x.ok_lat_ms.clone())
+                                .map(|v| format!("{v}ms"))
+                                .unwrap_or_else(|| "-".to_string());
+                            format!(
+                                "5m ok{} p95={} att{} 429={} 5xx={}",
+                                pct(x.ok, x.total),
+                                p95_ms,
+                                att(x.attempts_sum, x.total),
+                                x.err_429,
+                                x.err_5xx
+                            )
+                        })
+                        .unwrap_or_else(|| "5m -".to_string());
+                    let s1 = rt1
+                        .map(|x| {
+                            let p95_ms = p95(x.ok_lat_ms.clone())
+                                .map(|v| format!("{v}ms"))
+                                .unwrap_or_else(|| "-".to_string());
+                            format!(
+                                "1h ok{} p95={} att{} 429={} 5xx={}",
+                                pct(x.ok, x.total),
+                                p95_ms,
+                                att(x.attempts_sum, x.total),
+                                x.err_429,
+                                x.err_5xx
+                            )
+                        })
+                        .unwrap_or_else(|| "1h -".to_string());
+                    format!("{s5} | {s1}")
+                };
+                lines.push(Line::from(vec![
+                    Span::raw("     "),
+                    Span::styled("rt: ", Style::default().fg(p.muted)),
+                    Span::styled(runtime_line, Style::default().fg(p.muted)),
                 ]));
 
                 if !up.tags.is_empty() {

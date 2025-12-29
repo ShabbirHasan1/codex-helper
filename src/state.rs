@@ -3,6 +3,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
@@ -14,6 +15,18 @@ use crate::lb::LbState;
 use crate::logging::RetryInfo;
 use crate::sessions;
 use crate::usage::UsageMetrics;
+
+fn recent_finished_max() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("CODEX_HELPER_RECENT_FINISHED_MAX")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(2_000)
+            .clamp(200, 20_000)
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
 pub struct UsageBucket {
@@ -1068,7 +1081,7 @@ impl ProxyState {
 
         let mut recent = self.recent_finished.write().await;
         recent.push_front(finished);
-        while recent.len() > 200 {
+        while recent.len() > recent_finished_max() {
             recent.pop_back();
         }
     }
