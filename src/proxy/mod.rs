@@ -307,7 +307,7 @@ impl ProxyService {
         service_name: &'static str,
         lb_states: Arc<Mutex<HashMap<String, LbState>>>,
     ) -> Self {
-        let state = ProxyState::new();
+        let state = ProxyState::new_with_lb_states(Some(lb_states.clone()));
         ProxyState::spawn_cleanup_task(state.clone());
         {
             let service_name = service_name;

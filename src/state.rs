@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
@@ -9,6 +10,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
 
+use crate::lb::LbState;
 use crate::logging::RetryInfo;
 use crate::sessions;
 use crate::usage::UsageMetrics;
@@ -72,6 +74,19 @@ pub struct ConfigHealth {
     pub checked_at_ms: u64,
     #[serde(default)]
     pub upstreams: Vec<UpstreamHealth>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LbUpstreamView {
+    pub failure_count: u32,
+    pub cooldown_remaining_secs: Option<u64>,
+    pub usage_exhausted: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LbConfigView {
+    pub last_good_index: Option<usize>,
+    pub upstreams: Vec<LbUpstreamView>,
 }
 
 #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
@@ -215,10 +230,18 @@ pub struct ProxyState {
     usage_rollups: RwLock<HashMap<String, UsageRollup>>,
     config_health: RwLock<HashMap<String, HashMap<String, ConfigHealth>>>,
     health_checks: RwLock<HashMap<String, HashMap<String, HealthCheckStatus>>>,
+    lb_states: Option<Arc<Mutex<HashMap<String, LbState>>>>,
 }
 
 impl ProxyState {
+    #[allow(dead_code)]
     pub fn new() -> Arc<Self> {
+        Self::new_with_lb_states(None)
+    }
+
+    pub fn new_with_lb_states(
+        lb_states: Option<Arc<Mutex<HashMap<String, LbState>>>>,
+    ) -> Arc<Self> {
         let ttl_secs = std::env::var("CODEX_HELPER_SESSION_OVERRIDE_TTL_SECS")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
@@ -252,6 +275,7 @@ impl ProxyState {
             usage_rollups: RwLock::new(HashMap::new()),
             config_health: RwLock::new(HashMap::new()),
             health_checks: RwLock::new(HashMap::new()),
+            lb_states,
         })
     }
 
@@ -411,6 +435,66 @@ impl ProxyState {
     pub async fn get_config_health(&self, service_name: &str) -> HashMap<String, ConfigHealth> {
         let guard = self.config_health.read().await;
         guard.get(service_name).cloned().unwrap_or_default()
+    }
+
+    pub async fn get_lb_view(&self) -> HashMap<String, LbConfigView> {
+        let Some(lb_states) = self.lb_states.as_ref() else {
+            return HashMap::new();
+        };
+        let mut map = match lb_states.lock() {
+            Ok(m) => m,
+            Err(e) => e.into_inner(),
+        };
+
+        let now = std::time::Instant::now();
+        let mut out = HashMap::new();
+        for (cfg_name, st) in map.iter_mut() {
+            let len = st
+                .failure_counts
+                .len()
+                .max(st.cooldown_until.len())
+                .max(st.usage_exhausted.len());
+            if len == 0 {
+                continue;
+            }
+
+            // 如果结构变化导致长度不一致，做一次对齐，避免 UI 读到越界/脏数据。
+            if st.failure_counts.len() != len {
+                st.failure_counts.resize(len, 0);
+            }
+            if st.cooldown_until.len() != len {
+                st.cooldown_until.resize(len, None);
+            }
+            if st.usage_exhausted.len() != len {
+                st.usage_exhausted.resize(len, false);
+            }
+
+            let mut upstreams = Vec::with_capacity(len);
+            for idx in 0..len {
+                let failure_count = st.failure_counts.get(idx).copied().unwrap_or(0);
+                let cooldown_remaining_secs = st
+                    .cooldown_until
+                    .get(idx)
+                    .and_then(|v| *v)
+                    .map(|until| until.saturating_duration_since(now).as_secs())
+                    .filter(|&s| s > 0);
+                let usage_exhausted = st.usage_exhausted.get(idx).copied().unwrap_or(false);
+                upstreams.push(LbUpstreamView {
+                    failure_count,
+                    cooldown_remaining_secs,
+                    usage_exhausted,
+                });
+            }
+
+            out.insert(
+                cfg_name.clone(),
+                LbConfigView {
+                    last_good_index: st.last_good_index,
+                    upstreams,
+                },
+            );
+        }
+        out
     }
 
     pub async fn list_health_checks(

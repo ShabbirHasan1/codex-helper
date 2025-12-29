@@ -4,8 +4,8 @@ use std::time::Instant;
 use ratatui::prelude::{Color, Style};
 
 use crate::state::{
-    ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, ProxyState, SessionStats,
-    UsageRollupView,
+    ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState,
+    SessionStats, UsageRollupView,
 };
 use crate::usage::UsageMetrics;
 
@@ -13,6 +13,10 @@ use crate::usage::UsageMetrics;
 pub struct UpstreamSummary {
     pub base_url: String,
     pub provider_id: Option<String>,
+    pub auth: String,
+    pub tags: Vec<(String, String)>,
+    pub supported_models: Vec<String>,
+    pub model_mapping: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -59,6 +63,7 @@ pub(in crate::tui) struct Snapshot {
     pub(in crate::tui) usage_rollup: UsageRollupView,
     pub(in crate::tui) config_health: HashMap<String, ConfigHealth>,
     pub(in crate::tui) health_checks: HashMap<String, HealthCheckStatus>,
+    pub(in crate::tui) lb_view: HashMap<String, LbConfigView>,
     pub(in crate::tui) refreshed_at: Instant,
 }
 
@@ -420,6 +425,7 @@ pub(in crate::tui) async fn refresh_snapshot(
         rollup,
         health,
         health_checks,
+        lb_view,
     ) = tokio::join!(
         state.list_active_requests(),
         state.list_recent_finished(200),
@@ -431,6 +437,7 @@ pub(in crate::tui) async fn refresh_snapshot(
         state.get_usage_rollup_view(service_name, 12, stats_days),
         state.get_config_health(service_name),
         state.list_health_checks(service_name),
+        state.get_lb_view(),
     );
 
     let rows = build_session_rows(active, &recent, &overrides, &config_overrides, &stats);
@@ -444,6 +451,7 @@ pub(in crate::tui) async fn refresh_snapshot(
         usage_rollup: rollup,
         config_health: health,
         health_checks,
+        lb_view,
         refreshed_at: Instant::now(),
     }
 }

@@ -40,6 +40,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) stats_configs_table: TableState,
     pub(in crate::tui) stats_providers_table: TableState,
     pub(in crate::tui) menu_list: ListState,
+    pub(in crate::tui) config_info_scroll: u16,
 }
 
 impl Default for UiState {
@@ -79,6 +80,7 @@ impl Default for UiState {
             stats_configs_table: TableState::default(),
             stats_providers_table: TableState::default(),
             menu_list: ListState::default(),
+            config_info_scroll: 0,
         }
     }
 }

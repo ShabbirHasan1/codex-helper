@@ -44,6 +44,7 @@ pub(in crate::tui) fn render_app(
     match ui.overlay {
         Overlay::None => {}
         Overlay::Help => render_help_modal(f, p, ui.language),
+        Overlay::ConfigInfo => render_config_info_modal(f, p, ui, snapshot, providers),
         Overlay::EffortMenu => render_effort_modal(f, p, ui),
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
             let title = match ui.overlay {
@@ -906,6 +907,11 @@ fn render_configs_page(
             "Actions",
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         )]));
+        lines.push(Line::from(crate::tui::i18n::pick(
+            ui.language,
+            "  i            Provider 详情（可滚动）",
+            "  i            provider details (scrollable)",
+        )));
         lines.push(Line::from(
             "  Enter        set global override to selected config",
         ));
@@ -1634,8 +1640,8 @@ fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, area: Rect) {
             ),
             Page::Configs => crate::tui::i18n::pick(
                 ui.language,
-                "1-6 页面  q 退出  L 语言  ↑/↓ 选择  t 切换 enabled  +/- level  h 检查  H 全部检查  c 取消  C 全部取消  Enter 全局 override  Backspace 清除  o 会话 override  O 清除  ? 帮助",
-                "1-6 pages  q quit  L language  ↑/↓ select  t toggle enabled  +/- level  h check  H check all  c cancel  C cancel all  Enter global override  Backspace clear  o session override  O clear  ? help",
+                "1-6 页面  q 退出  L 语言  ↑/↓ 选择  i 详情  t 切换 enabled  +/- level  h 检查  H 全部检查  c 取消  C 全部取消  Enter 全局 override  Backspace 清除  o 会话 override  O 清除  ? 帮助",
+                "1-6 pages  q quit  L language  ↑/↓ select  i details  t toggle enabled  +/- level  h check  H check all  c cancel  C cancel all  Enter global override  Backspace clear  o session override  O clear  ? help",
             ),
             Page::Requests => crate::tui::i18n::pick(
                 ui.language,
@@ -1673,6 +1679,11 @@ fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, area: Rect) {
             "↑/↓ 选择  Enter 应用  Esc 取消",
             "↑/↓ select  Enter apply  Esc cancel",
         ),
+        Overlay::ConfigInfo => crate::tui::i18n::pick(
+            ui.language,
+            "↑/↓ 滚动  PgUp/PgDn 翻页  Esc 关闭  L 语言",
+            "↑/↓ scroll  PgUp/PgDn page  Esc close  L language",
+        ),
     };
     let right = ui.toast.as_ref().map(|(s, _)| s.as_str()).unwrap_or("");
 
@@ -1690,6 +1701,335 @@ fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, area: Rect) {
         Paragraph::new(Text::from(line)).wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn render_config_info_modal(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    providers: &[ProviderOption],
+) {
+    let area = centered_rect(84, 84, f.area());
+    f.render_widget(Clear, area);
+
+    let selected_session = snapshot
+        .rows
+        .get(ui.selected_session_idx)
+        .and_then(|r| r.session_id.as_deref())
+        .unwrap_or("-");
+    let session_override = snapshot
+        .rows
+        .get(ui.selected_session_idx)
+        .and_then(|r| r.override_config_name.as_deref());
+    let global_override = snapshot.global_override.as_deref();
+
+    let selected = providers.get(ui.selected_config_idx);
+    let title = if let Some(cfg) = selected {
+        let level = cfg.level.clamp(1, 10);
+        format!(
+            "{}: {} (L{})",
+            crate::tui::i18n::pick(ui.language, "配置详情", "Config details"),
+            cfg.name,
+            level
+        )
+    } else {
+        crate::tui::i18n::pick(ui.language, "配置详情", "Config details").to_string()
+    };
+
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.focus))
+        .style(Style::default().bg(p.panel));
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "会话：", "session: "),
+            Style::default().fg(p.muted),
+        ),
+        Span::styled(short_sid(selected_session, 28), Style::default().fg(p.text)),
+        Span::raw("   "),
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "固定：", "pinned: "),
+            Style::default().fg(p.muted),
+        ),
+        Span::styled(
+            if let Some(s) = session_override {
+                format!("session={s}")
+            } else if let Some(g) = global_override {
+                format!("global={g}")
+            } else {
+                "-".to_string()
+            },
+            Style::default().fg(if session_override.is_some() || global_override.is_some() {
+                p.accent
+            } else {
+                p.muted
+            }),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "按键：", "keys: "),
+            Style::default().fg(p.muted),
+        ),
+        Span::styled(
+            crate::tui::i18n::pick(
+                ui.language,
+                "↑/↓ 滚动  PgUp/PgDn 翻页  Esc 关闭  L 语言",
+                "↑/↓ scroll  PgUp/PgDn page  Esc close  L language",
+            ),
+            Style::default().fg(p.muted),
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    if let Some(cfg) = selected {
+        let (enabled_ovr, level_ovr) = snapshot
+            .config_meta_overrides
+            .get(cfg.name.as_str())
+            .copied()
+            .unwrap_or((None, None));
+        let enabled = enabled_ovr.unwrap_or(cfg.enabled);
+        let level = level_ovr.unwrap_or(cfg.level).clamp(1, 10);
+
+        if let Some(alias) = cfg.alias.as_deref()
+            && !alias.trim().is_empty()
+        {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    crate::tui::i18n::pick(ui.language, "别名：", "alias: "),
+                    Style::default().fg(p.muted),
+                ),
+                Span::styled(alias.to_string(), Style::default().fg(p.text)),
+            ]));
+        }
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                crate::tui::i18n::pick(ui.language, "状态：", "status: "),
+                Style::default().fg(p.muted),
+            ),
+            Span::styled(
+                crate::tui::i18n::pick(
+                    ui.language,
+                    if enabled { "启用" } else { "禁用" },
+                    if enabled { "enabled" } else { "disabled" },
+                ),
+                Style::default().fg(if enabled { p.good } else { p.warn }),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("L{level}"),
+                Style::default().fg(if level_ovr.is_some() {
+                    p.accent
+                } else {
+                    p.muted
+                }),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                crate::tui::i18n::pick(
+                    ui.language,
+                    if cfg.active { "active" } else { "" },
+                    if cfg.active { "active" } else { "" },
+                ),
+                Style::default().fg(if cfg.active { p.accent } else { p.muted }),
+            ),
+        ]));
+        lines.push(Line::from(""));
+
+        lines.push(Line::from(vec![Span::styled(
+            crate::tui::i18n::pick(ui.language, "上游（Providers）", "Upstreams (providers)"),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )]));
+
+        let health = snapshot.config_health.get(cfg.name.as_str());
+        let lb = snapshot.lb_view.get(cfg.name.as_str());
+
+        if cfg.upstreams.is_empty() {
+            lines.push(Line::from(Span::styled(
+                crate::tui::i18n::pick(ui.language, "（无）", "(none)"),
+                Style::default().fg(p.muted),
+            )));
+        } else {
+            for (idx, up) in cfg.upstreams.iter().enumerate() {
+                let pid = up.provider_id.as_deref().unwrap_or("-");
+                let auth = up.auth.as_str();
+
+                let (ok, status_code, latency_ms, err) = health
+                    .and_then(|h| h.upstreams.iter().find(|u| u.base_url == up.base_url))
+                    .map(|u| (u.ok, u.status_code, u.latency_ms, u.error.as_deref()))
+                    .unwrap_or((None, None, None, None));
+
+                let health_text = if let Some(ok) = ok {
+                    if ok {
+                        format!(
+                            "ok {} {}",
+                            status_code
+                                .map(|c| c.to_string())
+                                .unwrap_or_else(|| "-".to_string()),
+                            latency_ms
+                                .map(|m| format!("{m}ms"))
+                                .unwrap_or_else(|| "-".to_string())
+                        )
+                    } else {
+                        format!(
+                            "err {}",
+                            status_code
+                                .map(|c| c.to_string())
+                                .unwrap_or_else(|| "-".to_string())
+                        )
+                    }
+                } else {
+                    crate::tui::i18n::pick(ui.language, "未检查", "not checked").to_string()
+                };
+
+                let lb_text = lb
+                    .and_then(|v| v.upstreams.get(idx))
+                    .map(|u| {
+                        let mut parts = Vec::new();
+                        if lb.and_then(|v| v.last_good_index) == Some(idx) {
+                            parts.push("last_good".to_string());
+                        }
+                        if u.failure_count > 0 {
+                            parts.push(format!("fail={}", u.failure_count));
+                        }
+                        if let Some(secs) = u.cooldown_remaining_secs {
+                            parts.push(format!("cooldown={secs}s"));
+                        }
+                        if u.usage_exhausted {
+                            parts.push("exhausted".to_string());
+                        }
+                        if parts.is_empty() {
+                            "-".to_string()
+                        } else {
+                            parts.join(" ")
+                        }
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+
+                let models_text = if up.supported_models.is_empty() && up.model_mapping.is_empty() {
+                    crate::tui::i18n::pick(ui.language, "模型：全部", "models: all").to_string()
+                } else {
+                    let allow = up.supported_models.len();
+                    let map = up.model_mapping.len();
+                    crate::tui::i18n::pick(
+                        ui.language,
+                        &format!("模型：allow {allow} / map {map}"),
+                        &format!("models: allow {allow} / map {map}"),
+                    )
+                    .to_string()
+                };
+
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{idx:>2}. "), Style::default().fg(p.muted)),
+                    Span::styled(pid.to_string(), Style::default().fg(p.muted)),
+                    Span::raw("  "),
+                    Span::styled(shorten(&up.base_url, 100), Style::default().fg(p.text)),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("     "),
+                    Span::styled("auth: ", Style::default().fg(p.muted)),
+                    Span::styled(auth.to_string(), Style::default().fg(p.text)),
+                    Span::raw("   "),
+                    Span::styled(models_text, Style::default().fg(p.muted)),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("     "),
+                    Span::styled("health: ", Style::default().fg(p.muted)),
+                    Span::styled(
+                        health_text,
+                        Style::default().fg(if ok == Some(true) { p.good } else { p.warn }),
+                    ),
+                    Span::raw("   "),
+                    Span::styled("lb: ", Style::default().fg(p.muted)),
+                    Span::styled(lb_text, Style::default().fg(p.muted)),
+                ]));
+
+                if !up.tags.is_empty() {
+                    let tags = up
+                        .tags
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    lines.push(Line::from(vec![
+                        Span::raw("     "),
+                        Span::styled("tags: ", Style::default().fg(p.muted)),
+                        Span::styled(shorten(&tags, 120), Style::default().fg(p.muted)),
+                    ]));
+                }
+
+                if !up.supported_models.is_empty() {
+                    let samples = up
+                        .supported_models
+                        .iter()
+                        .take(8)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let mut s = samples.join(", ");
+                    if up.supported_models.len() > samples.len() {
+                        s.push_str(", …");
+                    }
+                    lines.push(Line::from(vec![
+                        Span::raw("     "),
+                        Span::styled("allow: ", Style::default().fg(p.muted)),
+                        Span::styled(s, Style::default().fg(p.muted)),
+                    ]));
+                }
+                if !up.model_mapping.is_empty() {
+                    let samples = up
+                        .model_mapping
+                        .iter()
+                        .take(6)
+                        .map(|(k, v)| format!("{k}->{v}"))
+                        .collect::<Vec<_>>();
+                    let mut s = samples.join(", ");
+                    if up.model_mapping.len() > samples.len() {
+                        s.push_str(", …");
+                    }
+                    lines.push(Line::from(vec![
+                        Span::raw("     "),
+                        Span::styled("map: ", Style::default().fg(p.muted)),
+                        Span::styled(s, Style::default().fg(p.muted)),
+                    ]));
+                }
+
+                if let Some(e) = err
+                    && !e.trim().is_empty()
+                {
+                    lines.push(Line::from(vec![
+                        Span::raw("     "),
+                        Span::styled(shorten(e, 140), Style::default().fg(p.muted)),
+                    ]));
+                }
+                lines.push(Line::from(""));
+            }
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            crate::tui::i18n::pick(ui.language, "未选中任何配置。", "No config selected."),
+            Style::default().fg(p.muted),
+        )));
+    }
+
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(inner_height);
+    ui.config_info_scroll = ui
+        .config_info_scroll
+        .min(max_scroll.min(u16::MAX as usize) as u16);
+
+    let content = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(Style::default().fg(p.muted))
+        .wrap(Wrap { trim: false })
+        .scroll((ui.config_info_scroll, 0));
+    f.render_widget(content, area);
 }
 
 fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui::Language) {
@@ -1739,6 +2079,7 @@ fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui::Language) 
             Line::from("  Backspace  清除全局 override"),
             Line::from("  o          设置会话 override 为当前 config"),
             Line::from("  O          清除会话 override"),
+            Line::from("  i          查看 Provider 详情（可滚动）"),
             Line::from("  t          切换 enabled（热更新 + 落盘）"),
             Line::from("  +/-        调整 level（热更新 + 落盘）"),
             Line::from("  h/H        运行健康检查（当前/全部）"),
@@ -1813,6 +2154,7 @@ fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui::Language) 
             Line::from("  Backspace  clear global override"),
             Line::from("  o          set session override to selected config"),
             Line::from("  O          clear session override"),
+            Line::from("  i          open provider details (scrollable)"),
             Line::from("  t          toggle enabled (hot reload + saved)"),
             Line::from("  +/-        adjust level (hot reload + saved)"),
             Line::from("  h/H        run health checks (selected/all)"),

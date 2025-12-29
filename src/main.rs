@@ -760,6 +760,60 @@ async fn run_server(service_name: &'static str, port: u16, enable_tui: bool) -> 
                 .await
         });
 
+        let upstream_summary = |u: &crate::config::UpstreamConfig| -> tui::UpstreamSummary {
+            let auth = if let Some(env) = u.auth.auth_token_env.as_deref()
+                && !env.trim().is_empty()
+            {
+                format!("bearer env {env}")
+            } else if u
+                .auth
+                .auth_token
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                "bearer inline".to_string()
+            } else if let Some(env) = u.auth.api_key_env.as_deref()
+                && !env.trim().is_empty()
+            {
+                format!("x-api-key env {env}")
+            } else if u
+                .auth
+                .api_key
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                "x-api-key inline".to_string()
+            } else {
+                "-".to_string()
+            };
+
+            let mut tags = u
+                .tags
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<Vec<_>>();
+            tags.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+            let mut supported_models = u.supported_models.keys().cloned().collect::<Vec<_>>();
+            supported_models.sort();
+
+            let mut model_mapping = u
+                .model_mapping
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<Vec<_>>();
+            model_mapping.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+            tui::UpstreamSummary {
+                base_url: u.base_url.clone(),
+                provider_id: u.tags.get("provider_id").cloned(),
+                auth,
+                tags,
+                supported_models,
+                model_mapping,
+            }
+        };
+
         let mut providers: Vec<tui::ProviderOption> = match service_name {
             "claude" => cfg
                 .claude
@@ -771,14 +825,7 @@ async fn run_server(service_name: &'static str, port: u16, enable_tui: bool) -> 
                     enabled: svc.enabled,
                     level: svc.level.clamp(1, 10),
                     active: cfg.claude.active.as_deref() == Some(name.as_str()),
-                    upstreams: svc
-                        .upstreams
-                        .iter()
-                        .map(|u| tui::UpstreamSummary {
-                            base_url: u.base_url.clone(),
-                            provider_id: u.tags.get("provider_id").cloned(),
-                        })
-                        .collect(),
+                    upstreams: svc.upstreams.iter().map(upstream_summary).collect(),
                 })
                 .collect(),
             _ => cfg
@@ -791,14 +838,7 @@ async fn run_server(service_name: &'static str, port: u16, enable_tui: bool) -> 
                     enabled: svc.enabled,
                     level: svc.level.clamp(1, 10),
                     active: cfg.codex.active.as_deref() == Some(name.as_str()),
-                    upstreams: svc
-                        .upstreams
-                        .iter()
-                        .map(|u| tui::UpstreamSummary {
-                            base_url: u.base_url.clone(),
-                            provider_id: u.tags.get("provider_id").cloned(),
-                        })
-                        .collect(),
+                    upstreams: svc.upstreams.iter().map(upstream_summary).collect(),
                 })
                 .collect(),
         };

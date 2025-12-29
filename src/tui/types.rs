@@ -28,6 +28,7 @@ pub(in crate::tui) enum Overlay {
     EffortMenu,
     ProviderMenuSession,
     ProviderMenuGlobal,
+    ConfigInfo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

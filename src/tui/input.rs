@@ -43,6 +43,41 @@ pub(in crate::tui) async fn handle_key_event(
             }
             _ => false,
         },
+        Overlay::ConfigInfo => match key.code {
+            KeyCode::Esc | KeyCode::Char('i') => {
+                ui.overlay = Overlay::None;
+                true
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                ui.config_info_scroll = ui.config_info_scroll.saturating_sub(1);
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                ui.config_info_scroll = ui.config_info_scroll.saturating_add(1);
+                true
+            }
+            KeyCode::PageUp => {
+                ui.config_info_scroll = ui.config_info_scroll.saturating_sub(10);
+                true
+            }
+            KeyCode::PageDown => {
+                ui.config_info_scroll = ui.config_info_scroll.saturating_add(10);
+                true
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                ui.config_info_scroll = 0;
+                true
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                ui.config_info_scroll = u16::MAX;
+                true
+            }
+            KeyCode::Char('L') => {
+                toggle_language(ui).await;
+                true
+            }
+            _ => false,
+        },
         Overlay::EffortMenu => handle_key_effort_menu(&state, ui, snapshot, key).await,
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
             handle_key_provider_menu(&state, providers, ui, snapshot, key).await
@@ -455,6 +490,11 @@ async fn handle_key_normal(
         }
         KeyCode::Char('?') => {
             ui.overlay = Overlay::Help;
+            true
+        }
+        KeyCode::Char('i') if ui.page == Page::Configs => {
+            ui.overlay = Overlay::ConfigInfo;
+            ui.config_info_scroll = 0;
             true
         }
         KeyCode::Tab => {
