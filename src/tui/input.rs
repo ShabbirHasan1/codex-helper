@@ -454,7 +454,7 @@ fn try_copy_to_clipboard(report: &str) -> anyhow::Result<()> {
     {
         let mut cmd = Command::new("cmd");
         cmd.args(["/C", "clip"]);
-        return run(cmd, report);
+        run(cmd, report)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
