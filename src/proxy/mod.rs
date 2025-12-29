@@ -310,7 +310,6 @@ impl ProxyService {
         let state = ProxyState::new_with_lb_states(Some(lb_states.clone()));
         ProxyState::spawn_cleanup_task(state.clone());
         {
-            let service_name = service_name;
             let state = state.clone();
             let log_path = crate::config::proxy_home_dir()
                 .join("logs")

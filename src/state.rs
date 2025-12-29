@@ -757,10 +757,7 @@ impl ProxyState {
             Ok(f) => f,
             Err(_) => return 0,
         };
-        let len = match file.metadata().map(|m| m.len()) {
-            Ok(n) => n,
-            Err(_) => 0,
-        };
+        let len: u64 = file.metadata().map(|m| m.len()).unwrap_or_default();
         let start = len.saturating_sub(max_bytes as u64);
         if file.seek(SeekFrom::Start(start)).is_err() {
             return 0;

@@ -101,9 +101,9 @@ fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
             ui.focus = Focus::Configs;
         } else if ui.page == Page::Requests {
             ui.focus = Focus::Requests;
-        } else if ui.page == Page::Sessions {
-            ui.focus = Focus::Sessions;
-        } else if ui.page == Page::Dashboard && ui.focus == Focus::Configs {
+        } else if ui.page == Page::Sessions
+            || (ui.page == Page::Dashboard && ui.focus == Focus::Configs)
+        {
             ui.focus = Focus::Sessions;
         }
         return true;
@@ -447,7 +447,7 @@ fn try_copy_to_clipboard(report: &str) -> anyhow::Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        return run(Command::new("pbcopy"), report);
+        run(Command::new("pbcopy"), report)
     }
 
     #[cfg(target_os = "windows")]

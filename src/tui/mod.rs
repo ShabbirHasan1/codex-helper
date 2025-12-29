@@ -52,9 +52,11 @@ pub async fn run_dashboard(
     let mut terminal = Terminal::new(backend)?;
     terminal.hide_cursor()?;
 
-    let mut ui = UiState::default();
-    ui.service_name = service_name;
-    ui.language = language;
+    let mut ui = UiState {
+        service_name,
+        language,
+        ..Default::default()
+    };
     let palette = Palette::default();
 
     let mut events = EventStream::new();
