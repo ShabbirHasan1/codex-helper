@@ -452,7 +452,9 @@ fn try_copy_to_clipboard(report: &str) -> anyhow::Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        return run(Command::new("cmd").args(["/C", "clip"]), report);
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "clip"]);
+        return run(cmd, report);
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -460,10 +462,9 @@ fn try_copy_to_clipboard(report: &str) -> anyhow::Result<()> {
         if let Ok(()) = run(Command::new("wl-copy"), report) {
             return Ok(());
         }
-        run(
-            Command::new("xclip").args(["-selection", "clipboard"]),
-            report,
-        )
+        let mut cmd = Command::new("xclip");
+        cmd.args(["-selection", "clipboard"]);
+        run(cmd, report)
     }
 }
 
