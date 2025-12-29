@@ -5,6 +5,7 @@ use super::types::{Focus, Overlay, Page};
 
 #[derive(Debug)]
 pub(in crate::tui) struct UiState {
+    pub(in crate::tui) service_name: &'static str,
     pub(in crate::tui) page: Page,
     pub(in crate::tui) focus: Focus,
     pub(in crate::tui) overlay: Overlay,
@@ -34,6 +35,7 @@ pub(in crate::tui) struct UiState {
 impl Default for UiState {
     fn default() -> Self {
         Self {
+            service_name: "codex",
             page: Page::Dashboard,
             focus: Focus::Sessions,
             overlay: Overlay::None,

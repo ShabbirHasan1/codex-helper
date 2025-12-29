@@ -108,6 +108,14 @@ struct SessionCwdCacheEntry {
     last_seen_ms: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ConfigMetaOverride {
+    enabled: Option<bool>,
+    level: Option<u8>,
+    #[allow(dead_code)]
+    updated_at_ms: u64,
+}
+
 /// Runtime-only state for the proxy process.
 ///
 /// This state is intentionally not persisted across restarts.
@@ -120,6 +128,7 @@ pub struct ProxyState {
     session_effort_overrides: RwLock<HashMap<String, SessionEffortOverride>>,
     session_config_overrides: RwLock<HashMap<String, SessionConfigOverride>>,
     global_config_override: RwLock<Option<String>>,
+    config_meta_overrides: RwLock<HashMap<String, HashMap<String, ConfigMetaOverride>>>,
     session_cwd_cache: RwLock<HashMap<String, SessionCwdCacheEntry>>,
     session_stats: RwLock<HashMap<String, SessionStats>>,
     active_requests: RwLock<HashMap<u64, ActiveRequest>>,
@@ -153,6 +162,7 @@ impl ProxyState {
             session_effort_overrides: RwLock::new(HashMap::new()),
             session_config_overrides: RwLock::new(HashMap::new()),
             global_config_override: RwLock::new(None),
+            config_meta_overrides: RwLock::new(HashMap::new()),
             session_cwd_cache: RwLock::new(HashMap::new()),
             session_stats: RwLock::new(HashMap::new()),
             active_requests: RwLock::new(HashMap::new()),
@@ -257,6 +267,49 @@ impl ProxyState {
     pub async fn clear_global_config_override(&self) {
         let mut guard = self.global_config_override.write().await;
         *guard = None;
+    }
+
+    pub async fn set_config_enabled_override(
+        &self,
+        service_name: &str,
+        config_name: String,
+        enabled: bool,
+        now_ms: u64,
+    ) {
+        let mut guard = self.config_meta_overrides.write().await;
+        let per_service = guard.entry(service_name.to_string()).or_default();
+        let entry = per_service.entry(config_name).or_default();
+        entry.enabled = Some(enabled);
+        entry.updated_at_ms = now_ms;
+    }
+
+    pub async fn set_config_level_override(
+        &self,
+        service_name: &str,
+        config_name: String,
+        level: u8,
+        now_ms: u64,
+    ) {
+        let mut guard = self.config_meta_overrides.write().await;
+        let per_service = guard.entry(service_name.to_string()).or_default();
+        let entry = per_service.entry(config_name).or_default();
+        entry.level = Some(level.clamp(1, 10));
+        entry.updated_at_ms = now_ms;
+    }
+
+    pub async fn get_config_meta_overrides(
+        &self,
+        service_name: &str,
+    ) -> HashMap<String, (Option<bool>, Option<u8>)> {
+        let guard = self.config_meta_overrides.read().await;
+        guard
+            .get(service_name)
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), (v.enabled, v.level)))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default()
     }
 
     pub async fn resolve_session_cwd(&self, session_id: &str) -> Option<String> {

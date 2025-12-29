@@ -48,13 +48,14 @@ pub async fn run_dashboard(
     terminal.hide_cursor()?;
 
     let mut ui = UiState::default();
+    ui.service_name = service_name;
     let palette = Palette::default();
 
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(refresh_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let mut snapshot = refresh_snapshot(&state).await;
+    let mut snapshot = refresh_snapshot(&state, service_name).await;
     ui.clamp_selection(&snapshot, providers.len());
 
     let mut should_redraw = true;
@@ -81,7 +82,7 @@ pub async fn run_dashboard(
 
         tokio::select! {
             _ = ticker.tick() => {
-                snapshot = refresh_snapshot(&state).await;
+                snapshot = refresh_snapshot(&state, service_name).await;
                 ui.clamp_selection(&snapshot, providers.len());
                 should_redraw = true;
             }

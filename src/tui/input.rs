@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::config::{load_config, save_config};
 use crate::state::ProxyState;
 
 use super::model::{ProviderOption, Snapshot, filtered_requests_len, now_ms};
@@ -109,6 +110,31 @@ async fn apply_global_provider_override(state: &ProxyState, cfg: Option<String>)
     }
 }
 
+async fn persist_config_meta(
+    ui: &UiState,
+    config_name: &str,
+    enabled: Option<bool>,
+    level: Option<u8>,
+) -> anyhow::Result<()> {
+    let mut cfg = load_config().await?;
+    let mgr = if ui.service_name == "claude" {
+        &mut cfg.claude
+    } else {
+        &mut cfg.codex
+    };
+    let Some(svc) = mgr.configs.get_mut(config_name) else {
+        anyhow::bail!("config '{config_name}' not found");
+    };
+    if let Some(enabled) = enabled {
+        svc.enabled = enabled;
+    }
+    if let Some(level) = level {
+        svc.level = level.clamp(1, 10);
+    }
+    save_config(&cfg).await?;
+    Ok(())
+}
+
 async fn handle_key_normal(
     state: &ProxyState,
     providers: &[ProviderOption],
@@ -205,6 +231,80 @@ async fn handle_key_normal(
             };
             apply_session_provider_override(state, sid, None).await;
             ui.toast = Some(("session cfg override: <clear>".to_string(), Instant::now()));
+            true
+        }
+        KeyCode::Char('t') if ui.page == Page::Configs => {
+            let Some(pvd) = providers.get(ui.selected_config_idx) else {
+                return true;
+            };
+            let (enabled_ovr, _) = snapshot
+                .config_meta_overrides
+                .get(pvd.name.as_str())
+                .copied()
+                .unwrap_or((None, None));
+            let current = enabled_ovr.unwrap_or(pvd.enabled);
+            let next = !current;
+            let now = now_ms();
+            state
+                .set_config_enabled_override(ui.service_name, pvd.name.clone(), next, now)
+                .await;
+
+            if let Err(err) = persist_config_meta(ui, &pvd.name, Some(next), None).await {
+                ui.toast = Some((format!("save failed: {err}"), Instant::now()));
+            } else {
+                ui.toast = Some((
+                    format!(
+                        "config {} enabled={}",
+                        pvd.name,
+                        if next { "true" } else { "false" }
+                    ),
+                    Instant::now(),
+                ));
+            }
+            true
+        }
+        KeyCode::Char('+') | KeyCode::Char('=') if ui.page == Page::Configs => {
+            let Some(pvd) = providers.get(ui.selected_config_idx) else {
+                return true;
+            };
+            let (_, level_ovr) = snapshot
+                .config_meta_overrides
+                .get(pvd.name.as_str())
+                .copied()
+                .unwrap_or((None, None));
+            let current = level_ovr.unwrap_or(pvd.level).clamp(1, 10);
+            let next = (current + 1).min(10);
+            let now = now_ms();
+            state
+                .set_config_level_override(ui.service_name, pvd.name.clone(), next, now)
+                .await;
+            if let Err(err) = persist_config_meta(ui, &pvd.name, None, Some(next)).await {
+                ui.toast = Some((format!("save failed: {err}"), Instant::now()));
+            } else {
+                ui.toast = Some((format!("config {} level={next}", pvd.name), Instant::now()));
+            }
+            true
+        }
+        KeyCode::Char('-') if ui.page == Page::Configs => {
+            let Some(pvd) = providers.get(ui.selected_config_idx) else {
+                return true;
+            };
+            let (_, level_ovr) = snapshot
+                .config_meta_overrides
+                .get(pvd.name.as_str())
+                .copied()
+                .unwrap_or((None, None));
+            let current = level_ovr.unwrap_or(pvd.level).clamp(1, 10);
+            let next = current.saturating_sub(1).max(1);
+            let now = now_ms();
+            state
+                .set_config_level_override(ui.service_name, pvd.name.clone(), next, now)
+                .await;
+            if let Err(err) = persist_config_meta(ui, &pvd.name, None, Some(next)).await {
+                ui.toast = Some((format!("save failed: {err}"), Instant::now()));
+            } else {
+                ui.toast = Some((format!("config {} level={next}", pvd.name), Instant::now()));
+            }
             true
         }
         KeyCode::Char('a') if ui.page == Page::Sessions => {

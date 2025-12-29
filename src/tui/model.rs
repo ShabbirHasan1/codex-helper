@@ -52,6 +52,7 @@ pub(in crate::tui) struct Snapshot {
     pub(in crate::tui) overrides: HashMap<String, String>,
     pub(in crate::tui) config_overrides: HashMap<String, String>,
     pub(in crate::tui) global_override: Option<String>,
+    pub(in crate::tui) config_meta_overrides: HashMap<String, (Option<bool>, Option<u8>)>,
     pub(in crate::tui) refreshed_at: Instant,
 }
 
@@ -397,14 +398,15 @@ fn build_session_rows(
     rows
 }
 
-pub(in crate::tui) async fn refresh_snapshot(state: &ProxyState) -> Snapshot {
-    let (active, recent, overrides, config_overrides, global_override, stats) = tokio::join!(
+pub(in crate::tui) async fn refresh_snapshot(state: &ProxyState, service_name: &str) -> Snapshot {
+    let (active, recent, overrides, config_overrides, global_override, stats, config_meta) = tokio::join!(
         state.list_active_requests(),
         state.list_recent_finished(200),
         state.list_session_effort_overrides(),
         state.list_session_config_overrides(),
         state.get_global_config_override(),
         state.list_session_stats(),
+        state.get_config_meta_overrides(service_name),
     );
 
     let rows = build_session_rows(active, &recent, &overrides, &config_overrides, &stats);
@@ -414,6 +416,7 @@ pub(in crate::tui) async fn refresh_snapshot(state: &ProxyState) -> Snapshot {
         overrides,
         config_overrides,
         global_override,
+        config_meta_overrides: config_meta,
         refreshed_at: Instant::now(),
     }
 }

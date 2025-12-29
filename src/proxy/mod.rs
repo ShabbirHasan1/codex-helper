@@ -344,6 +344,10 @@ impl ProxyService {
 
     async fn lbs_for_request(&self, session_id: Option<&str>) -> Vec<LoadBalancer> {
         let mgr = self.service_manager();
+        let meta_overrides = self
+            .state
+            .get_config_meta_overrides(self.service_name)
+            .await;
         if let Some(name) = self.pinned_config_name(session_id).await {
             if let Some(svc) = mgr
                 .configs
@@ -361,15 +365,26 @@ impl ProxyService {
             .configs
             .iter()
             .filter(|(name, svc)| {
+                let (enabled_ovr, _) = meta_overrides
+                    .get(name.as_str())
+                    .copied()
+                    .unwrap_or((None, None));
+                let enabled = enabled_ovr.unwrap_or(svc.enabled);
                 !svc.upstreams.is_empty()
-                    && (svc.enabled || active_name.is_some_and(|n| n == name.as_str()))
+                    && (enabled || active_name.is_some_and(|n| n == name.as_str()))
             })
             .collect::<Vec<_>>();
 
         let has_multi_level = {
             let mut levels = configs
                 .iter()
-                .map(|(_, svc)| svc.level.clamp(1, 10))
+                .map(|(name, svc)| {
+                    let (_, level_ovr) = meta_overrides
+                        .get(name.as_str())
+                        .copied()
+                        .unwrap_or((None, None));
+                    level_ovr.unwrap_or(svc.level).clamp(1, 10)
+                })
                 .collect::<Vec<_>>();
             levels.sort_unstable();
             levels.dedup();
@@ -401,8 +416,16 @@ impl ProxyService {
         }
 
         configs.sort_by(|(a_name, a), (b_name, b)| {
-            let a_level = a.level.clamp(1, 10);
-            let b_level = b.level.clamp(1, 10);
+            let a_level = meta_overrides
+                .get(a_name.as_str())
+                .and_then(|(_, l)| *l)
+                .unwrap_or(a.level)
+                .clamp(1, 10);
+            let b_level = meta_overrides
+                .get(b_name.as_str())
+                .and_then(|(_, l)| *l)
+                .unwrap_or(b.level)
+                .clamp(1, 10);
             let a_active = active_name.is_some_and(|n| n == a_name.as_str());
             let b_active = active_name.is_some_and(|n| n == b_name.as_str());
             a_level

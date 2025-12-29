@@ -541,6 +541,14 @@ fn render_configs_page(
     let rows = providers
         .iter()
         .map(|cfg| {
+            let (enabled_ovr, level_ovr) = snapshot
+                .config_meta_overrides
+                .get(cfg.name.as_str())
+                .copied()
+                .unwrap_or((None, None));
+            let enabled = enabled_ovr.unwrap_or(cfg.enabled);
+            let level = level_ovr.unwrap_or(cfg.level).clamp(1, 10);
+
             let mut name = cfg.name.clone();
             if cfg.active {
                 name = format!("* {name}");
@@ -551,10 +559,10 @@ fn render_configs_page(
                 .as_deref()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or("-");
-            let on = if cfg.enabled { "on" } else { "off" };
+            let on = if enabled { "on" } else { "off" };
             let up = cfg.upstreams.len().to_string();
 
-            let mut style = Style::default().fg(if cfg.enabled { p.text } else { p.muted });
+            let mut style = Style::default().fg(if enabled { p.text } else { p.muted });
             if global_override == Some(cfg.name.as_str()) {
                 style = style.fg(p.accent).add_modifier(Modifier::BOLD);
             }
@@ -563,7 +571,7 @@ fn render_configs_page(
             }
 
             Row::new([
-                format!("L{}", cfg.level.clamp(1, 10)),
+                format!("L{level}"),
                 name,
                 alias.to_string(),
                 on.to_string(),
@@ -603,6 +611,24 @@ fn render_configs_page(
 
     let mut lines = Vec::new();
     if let Some(cfg) = selected {
+        let (enabled_ovr, level_ovr) = snapshot
+            .config_meta_overrides
+            .get(cfg.name.as_str())
+            .copied()
+            .unwrap_or((None, None));
+        let enabled = enabled_ovr.unwrap_or(cfg.enabled);
+        let level = level_ovr.unwrap_or(cfg.level).clamp(1, 10);
+        let level_note = if level_ovr.is_some() {
+            " (override)"
+        } else {
+            ""
+        };
+        let enabled_note = if enabled_ovr.is_some() {
+            " (override)"
+        } else {
+            ""
+        };
+
         if let Some(alias) = cfg.alias.as_deref()
             && !alias.trim().is_empty()
         {
@@ -614,8 +640,14 @@ fn render_configs_page(
         lines.push(Line::from(vec![
             Span::styled("enabled: ", Style::default().fg(p.muted)),
             Span::styled(
-                if cfg.enabled { "true" } else { "false" },
-                Style::default().fg(if cfg.enabled { p.good } else { p.warn }),
+                format!("{}{enabled_note}", if enabled { "true" } else { "false" }),
+                Style::default().fg(if enabled { p.good } else { p.warn }),
+            ),
+            Span::raw("   "),
+            Span::styled("level: ", Style::default().fg(p.muted)),
+            Span::styled(
+                format!("L{level}{level_note}"),
+                Style::default().fg(p.muted),
             ),
             Span::raw("   "),
             Span::styled("active: ", Style::default().fg(p.muted)),
@@ -683,6 +715,15 @@ fn render_configs_page(
             "  o            set session override to selected config",
         ));
         lines.push(Line::from("  O            clear session override"));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "Edit (hot reload + persisted)",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )]));
+        lines.push(Line::from(
+            "  t            toggle enabled (immediate, saved)",
+        ));
+        lines.push(Line::from("  +/-          adjust level (immediate, saved)"));
     } else {
         lines.push(Line::from(Span::styled(
             "No configs available.",
@@ -1377,7 +1418,7 @@ fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, area: Rect) {
                 "q quit  Tab focus  ↑/↓ or j/k move  Enter effort  l/m/h/X set effort  x clear  p session cfg  P global cfg  ? help"
             }
             Page::Configs => {
-                "q quit  ↑/↓ select  Enter global override  Backspace clear  o session override  O clear  ? help"
+                "q quit  ↑/↓ select  t toggle enabled  +/- level  Enter global override  Backspace clear  o session override  O clear  ? help"
             }
             Page::Requests => "q quit  ↑/↓ select  e errors_only  s scope(session/all)  ? help",
             Page::Sessions => {
@@ -1453,6 +1494,8 @@ fn render_help_modal(f: &mut Frame<'_>, p: Palette) {
         Line::from("  Backspace  clear global override"),
         Line::from("  o          set session override to selected config"),
         Line::from("  O          clear session override"),
+        Line::from("  t          toggle enabled (hot reload + saved)"),
+        Line::from("  +/-        adjust level (hot reload + saved)"),
         Line::from(""),
         Line::from(vec![Span::styled(
             "Requests page",

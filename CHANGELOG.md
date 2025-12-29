@@ -9,6 +9,10 @@ All notable changes to this project will be documented in this file.
   TUI upgrade: rewrite the built-in dashboard with `ratatui v0.30`, with clearer information hierarchy, more breathable layout, and a modular structure for future features.
 - TUI Configs 页：新增 Configs 视图用于查看 level 分组/启用状态，并可快速设置全局/会话级配置覆盖（pin 到单一 config）。  
   TUI Configs page: add a Configs view for level grouping/enabled status, with quick global/session overrides (pin to a single config).
+- TUI 热编辑并即时生效：在 Configs 页可直接切换 `enabled`、调整 `level`，变更会立即影响路由，并自动落盘到配置文件（重启后仍生效）。  
+  Live config edits in TUI: toggle `enabled` and adjust `level` directly in the Configs page; changes take effect immediately for routing and are persisted to the config file.
+- TUI 多页监控与可解释性：新增 Sessions/Requests 页，支持快速筛选，并在请求详情中展示“上游尝试链路（route chain）”。  
+  Multi-page monitoring + explainability: add Sessions/Requests pages with quick filters, and show the upstream attempt chain (route chain) in request details.
 - 模型白名单与映射（支持通配符）：为每个上游增加 `supported_models` / `model_mapping`（兼容 JSON `supportedModels` / `modelMapping`），代理会自动过滤不支持的上游并在转发前重写 `model` 字段。  
   Model allowlist + mapping (wildcards supported): add per-upstream `supported_models` / `model_mapping` (JSON compatible via `supportedModels` / `modelMapping`); the proxy skips incompatible upstreams and rewrites `model` before forwarding.
 - Level 分组（跨配置降级）：为每个配置增加 `level` / `enabled`，当存在多个 level 时，会按 level 从低到高（1→10）进行自动路由与故障降级。  
@@ -19,6 +23,10 @@ All notable changes to this project will be documented in this file.
   Startup warnings for model routing config: warns about missing allowlist/mapping, mapping without allowlist, and invalid mapping targets.
 - `config` 子命令增强：支持 `config set-level` / `config enable` / `config disable`，并在 `config list` 中显示 `level/enabled`。  
   Better `config` subcommands: add `config set-level` / `config enable` / `config disable`, and show `level/enabled` in `config list`.
+- TUI Sessions 页：按会话维度查看活跃/错误/覆盖等状态，并提供联动筛选与快速重置。  
+  TUI Sessions page: inspect sessions with active/error/override views, plus linked filters and quick reset.
+- TUI Requests 页：按请求维度查看最新请求，支持错误筛选与 scope 切换，并展示每次重试的上游链路。  
+  TUI Requests page: inspect recent requests with error filter and scope switch, and show the per-retry upstream chain.
 
 ### 测试 / Tests
 - 新增用例覆盖：按模型过滤上游、以及请求体 `model` 自动映射。  
