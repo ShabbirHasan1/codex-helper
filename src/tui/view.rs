@@ -1553,17 +1553,17 @@ fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, area: Rect) {
     let left = match ui.overlay {
         Overlay::None => match ui.page {
             Page::Dashboard => {
-                "q quit  Tab focus  ↑/↓ or j/k move  Enter effort  l/m/h/X set effort  x clear  p session cfg  P global cfg  ? help"
+                "1-6 pages  q quit  Tab focus  ↑/↓ or j/k move  Enter effort  l/m/h/X set effort  x clear  p session cfg  P global cfg  ? help"
             }
             Page::Configs => {
-                "q quit  ↑/↓ select  t toggle enabled  +/- level  h check  H check all  c cancel  C cancel all  Enter global override  Backspace clear  o session override  O clear  ? help"
+                "1-6 pages  q quit  ↑/↓ select  t toggle enabled  +/- level  h check  H check all  c cancel  C cancel all  Enter global override  Backspace clear  o session override  O clear  ? help"
             }
             Page::Requests => "q quit  ↑/↓ select  e errors_only  s scope(session/all)  ? help",
             Page::Sessions => {
                 "q quit  ↑/↓ select  a active_only  e errors_only  v overrides_only  r reset  ? help"
             }
             Page::Stats => {
-                "q quit  Tab focus(config/provider)  ↑/↓ select  d days(7/21/60)  e errors_only(recent)  ? help"
+                "1-6 pages  q quit  Tab focus(config/provider)  ↑/↓ select  d days(7/21/60)  e errors_only(recent)  ? help"
             }
             Page::Settings => "q quit  ? help",
         },
@@ -1610,7 +1610,10 @@ fn render_help_modal(f: &mut Frame<'_>, p: Palette) {
         )]),
         Line::from("  Tab        switch focus (Dashboard)"),
         Line::from("  ↑/↓, j/k   move selection"),
-        Line::from("  1-5        switch page"),
+        Line::from("  1-6        switch page"),
+        Line::from(
+            "            1 Dashboard  2 Configs  3 Sessions  4 Requests  5 Stats  6 Settings",
+        ),
         Line::from(""),
         Line::from(vec![Span::styled(
             "Effort",
@@ -1637,6 +1640,8 @@ fn render_help_modal(f: &mut Frame<'_>, p: Palette) {
         Line::from("  O          clear session override"),
         Line::from("  t          toggle enabled (hot reload + saved)"),
         Line::from("  +/-        adjust level (hot reload + saved)"),
+        Line::from("  h/H        run health checks (selected/all)"),
+        Line::from("  c/C        cancel health checks (selected/all)"),
         Line::from(""),
         Line::from(vec![Span::styled(
             "Requests page",
@@ -1653,6 +1658,14 @@ fn render_help_modal(f: &mut Frame<'_>, p: Palette) {
         Line::from("  e          toggle errors-only"),
         Line::from("  v          toggle overrides-only"),
         Line::from("  r          reset filters"),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "Stats page",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )]),
+        Line::from("  Tab        switch focus (config vs provider)"),
+        Line::from("  d          cycle time window (7/21/60 days)"),
+        Line::from("  e          toggle errors-only (recent breakdown)"),
         Line::from(""),
         Line::from(vec![Span::styled(
             "Quit",

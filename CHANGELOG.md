@@ -39,6 +39,8 @@ All notable changes to this project will be documented in this file.
   TUI Configs health checks: `h` checks selected config, `H` checks all configs; results show per-upstream latency and status code.
 - 健康检查体验增强：Configs 列表展示进行中/取消状态；支持 `c`/`C` 取消检查，并提供批量检查并发上限（`CODEX_HELPER_TUI_HEALTHCHECK_MAX_INFLIGHT`）。  
   Health check UX improvements: show running/cancel states in Configs; support `c`/`C` to cancel checks, plus a max in-flight limit (`CODEX_HELPER_TUI_HEALTHCHECK_MAX_INFLIGHT`).
+- TUI 可发现性增强：顶部 Tabs 标题包含页号（`1-6`），Help 弹窗同步更新，便于快速切页。  
+  TUI discoverability: top tabs include page numbers (`1-6`) and the Help modal reflects this for faster page switching.
 - 请求日志增强：`requests.jsonl` 增加 `provider_id` 字段（如 upstream tags 里配置了 `provider_id`），用于更准确的统计与排障。  
   Request log enhancement: add `provider_id` field to `requests.jsonl` (when upstream tags include `provider_id`) for better stats and debugging.
 

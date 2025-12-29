@@ -63,12 +63,12 @@ impl EffortChoice {
 
 pub(in crate::tui) fn page_titles() -> [&'static str; 6] {
     [
-        "Dashboard",
-        "Configs",
-        "Sessions",
-        "Requests",
-        "Stats",
-        "Settings",
+        "1 Dashboard",
+        "2 Configs",
+        "3 Sessions",
+        "4 Requests",
+        "5 Stats",
+        "6 Settings",
     ]
 }
 
