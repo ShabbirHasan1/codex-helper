@@ -1666,6 +1666,52 @@ pub fn router(proxy: ProxyService) -> Router {
         effort: Option<String>,
     }
 
+    #[derive(serde::Serialize)]
+    struct RuntimeConfigStatus {
+        config_path: String,
+        loaded_at_ms: u64,
+        source_mtime_ms: Option<u64>,
+        retry: crate::config::RetryConfig,
+    }
+
+    #[derive(serde::Serialize)]
+    struct ReloadResult {
+        reloaded: bool,
+        status: RuntimeConfigStatus,
+    }
+
+    async fn runtime_config_status(
+        proxy: ProxyService,
+    ) -> Result<Json<RuntimeConfigStatus>, (StatusCode, String)> {
+        let cfg = proxy.config.snapshot().await;
+        Ok(Json(RuntimeConfigStatus {
+            config_path: crate::config::config_file_path().display().to_string(),
+            loaded_at_ms: proxy.config.last_loaded_at_ms(),
+            source_mtime_ms: proxy.config.last_mtime_ms().await,
+            retry: cfg.retry.clone(),
+        }))
+    }
+
+    async fn reload_runtime_config(
+        proxy: ProxyService,
+    ) -> Result<Json<ReloadResult>, (StatusCode, String)> {
+        let changed = proxy
+            .config
+            .force_reload_from_disk()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let cfg = proxy.config.snapshot().await;
+        Ok(Json(ReloadResult {
+            reloaded: changed,
+            status: RuntimeConfigStatus {
+                config_path: crate::config::config_file_path().display().to_string(),
+                loaded_at_ms: proxy.config.last_loaded_at_ms(),
+                source_mtime_ms: proxy.config.last_mtime_ms().await,
+                retry: cfg.retry.clone(),
+            },
+        }))
+    }
+
     async fn set_session_override(
         proxy: ProxyService,
         Json(payload): Json<SessionOverrideRequest>,
@@ -1733,12 +1779,24 @@ pub fn router(proxy: ProxyService) -> Router {
     let p2 = proxy.clone();
     let p3 = proxy.clone();
     let p4 = proxy.clone();
+    let p5 = proxy.clone();
+    let p6 = proxy.clone();
+    let p7 = proxy.clone();
 
     Router::new()
         .route(
             "/__codex_helper/override/session",
             get(move || list_session_overrides(p0.clone()))
                 .post(move |payload| set_session_override(p1.clone(), payload)),
+        )
+        .route(
+            "/__codex_helper/config/runtime",
+            get(move || runtime_config_status(p5.clone())),
+        )
+        .route(
+            "/__codex_helper/config/reload",
+            get(move || runtime_config_status(p6.clone()))
+                .post(move || reload_runtime_config(p7.clone())),
         )
         .route(
             "/__codex_helper/status/active",

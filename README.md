@@ -195,6 +195,10 @@ ch
   codex-helper config overwrite-from-codex --yes
   ```
 
+### TUI 设置页（运行态）
+
+- `R`：立即重载运行态配置（用于确认手动修改已生效；下一次请求将使用新配置）
+
 ### 会话、用量与诊断
 
 - 会话助手（Codex）：

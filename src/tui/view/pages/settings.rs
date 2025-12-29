@@ -211,18 +211,64 @@ pub(super) fn render_settings_page(
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
+        crate::tui::i18n::pick(ui.language, "运行态配置", "Runtime config"),
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+    )]));
+    let loaded = ui
+        .last_runtime_config_loaded_at_ms
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let mtime = ui
+        .last_runtime_config_source_mtime_ms
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    lines.push(Line::from(vec![
+        Span::styled("loaded_at_ms: ", Style::default().fg(p.muted)),
+        Span::styled(loaded, Style::default().fg(p.text)),
+        Span::styled("  mtime_ms: ", Style::default().fg(p.muted)),
+        Span::styled(mtime, Style::default().fg(p.text)),
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "  (按 R 立即重载)", "  (press R to reload)"),
+            Style::default().fg(p.muted),
+        ),
+    ]));
+    if let Some(retry) = ui.last_runtime_retry.as_ref() {
+        lines.push(Line::from(vec![
+            Span::styled("retry: ", Style::default().fg(p.muted)),
+            Span::styled(
+                format!(
+                    "attempts={} backoff={}..{} jitter={} cooldown(cf_chal={}s cf_to={}s transport={}s)",
+                    retry.max_attempts,
+                    retry.backoff_ms,
+                    retry.backoff_max_ms,
+                    retry.jitter_ms,
+                    retry.cloudflare_challenge_cooldown_secs,
+                    retry.cloudflare_timeout_cooldown_secs,
+                    retry.transport_cooldown_secs
+                ),
+                Style::default().fg(p.muted),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  on_status: ", Style::default().fg(p.muted)),
+            Span::styled(retry.on_status.clone(), Style::default().fg(p.muted)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
         crate::tui::i18n::pick(ui.language, "常用快捷键", "Common keys"),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     )]));
     lines.push(Line::from(crate::tui::i18n::pick(
         ui.language,
         if ui.service_name == "codex" {
-            "  1-6 切页  ? 帮助  q 退出  L 语言  (Configs: i 详情  Stats: y 导出/复制  Settings: O 覆盖导入(二次确认))"
+            "  1-6 切页  ? 帮助  q 退出  L 语言  (Configs: i 详情  Stats: y 导出/复制  Settings: R 重载配置  O 覆盖导入(二次确认))"
         } else {
             "  1-6 切页  ? 帮助  q 退出  L 语言  (Configs: i 详情  Stats: y 导出/复制)"
         },
         if ui.service_name == "codex" {
-            "  1-6 pages  ? help  q quit  L language  (Configs: i details  Stats: y export/copy  Settings: O overwrite(confirm))"
+            "  1-6 pages  ? help  q quit  L language  (Configs: i details  Stats: y export/copy  Settings: R reload  O overwrite(confirm))"
         } else {
             "  1-6 pages  ? help  q quit  L language  (Configs: i details  Stats: y export/copy)"
         },

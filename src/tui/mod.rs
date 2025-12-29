@@ -15,6 +15,7 @@ pub use model::{ProviderOption, UpstreamSummary, build_provider_options};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use crossterm::ExecutableCommand;
 use crossterm::event::{Event, EventStream};
@@ -55,6 +56,7 @@ pub async fn run_dashboard(
 
     let mut ui = UiState {
         service_name,
+        port,
         language,
         refresh_ms,
         ..Default::default()
@@ -95,6 +97,34 @@ pub async fn run_dashboard(
             _ = ticker.tick() => {
                 snapshot = refresh_snapshot(&state, service_name, ui.stats_days).await;
                 ui.clamp_selection(&snapshot, providers.len());
+                if ui.page == crate::tui::types::Page::Settings
+                    && ui
+                        .last_runtime_config_refresh_at
+                        .is_none_or(|t| t.elapsed() > Duration::from_secs(1))
+                {
+                    let url =
+                        format!("http://127.0.0.1:{}/__codex_helper/config/runtime", ui.port);
+                    let fetch = async {
+                        let client = reqwest::Client::new();
+                        client
+                            .get(&url)
+                            .send()
+                            .await?
+                            .error_for_status()?
+                            .json::<serde_json::Value>()
+                            .await
+                    };
+                    if let Ok(v) = fetch.await {
+                        ui.last_runtime_config_loaded_at_ms =
+                            v.get("loaded_at_ms").and_then(|x| x.as_u64());
+                        ui.last_runtime_config_source_mtime_ms =
+                            v.get("source_mtime_ms").and_then(|x| x.as_u64());
+                        ui.last_runtime_retry = v
+                            .get("retry")
+                            .and_then(|x| serde_json::from_value(x.clone()).ok());
+                    }
+                    ui.last_runtime_config_refresh_at = Some(Instant::now());
+                }
                 should_redraw = true;
             }
             changed = shutdown_rx.changed() => {

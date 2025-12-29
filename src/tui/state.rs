@@ -1,5 +1,7 @@
 use ratatui::widgets::{ListState, TableState};
 
+use crate::config::RetryConfig;
+
 use super::Language;
 use super::model::{Snapshot, filtered_requests_len};
 use super::types::{Focus, Overlay, Page, StatsFocus};
@@ -7,6 +9,7 @@ use super::types::{Focus, Overlay, Page, StatsFocus};
 #[derive(Debug)]
 pub(in crate::tui) struct UiState {
     pub(in crate::tui) service_name: &'static str,
+    pub(in crate::tui) port: u16,
     pub(in crate::tui) language: Language,
     pub(in crate::tui) refresh_ms: u64,
     pub(in crate::tui) page: Page,
@@ -33,6 +36,10 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) needs_snapshot_refresh: bool,
     pub(in crate::tui) toast: Option<(String, std::time::Instant)>,
     pub(in crate::tui) pending_overwrite_from_codex_confirm_at: Option<std::time::Instant>,
+    pub(in crate::tui) last_runtime_config_loaded_at_ms: Option<u64>,
+    pub(in crate::tui) last_runtime_config_source_mtime_ms: Option<u64>,
+    pub(in crate::tui) last_runtime_retry: Option<RetryConfig>,
+    pub(in crate::tui) last_runtime_config_refresh_at: Option<std::time::Instant>,
     pub(in crate::tui) should_exit: bool,
     pub(in crate::tui) configs_table: TableState,
     pub(in crate::tui) sessions_table: TableState,
@@ -49,6 +56,7 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             service_name: "codex",
+            port: 3211,
             language: Language::En,
             refresh_ms: 500,
             page: Page::Dashboard,
@@ -75,6 +83,10 @@ impl Default for UiState {
             needs_snapshot_refresh: false,
             toast: None,
             pending_overwrite_from_codex_confirm_at: None,
+            last_runtime_config_loaded_at_ms: None,
+            last_runtime_config_source_mtime_ms: None,
+            last_runtime_retry: None,
+            last_runtime_config_refresh_at: None,
             should_exit: false,
             configs_table: TableState::default(),
             sessions_table: TableState::default(),

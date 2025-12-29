@@ -233,6 +233,10 @@ If you prefer to keep upstreams in separate configs, codex-helper also supports 
   codex-helper config overwrite-from-codex --yes
   ```
 
+### TUI Settings (runtime)
+
+- `R`: reload runtime config now (helps confirm manual edits; next request will use the new config)
+
 ### Sessions, usage, diagnostics
 
 - Session helpers (Codex):

@@ -9,6 +9,8 @@ All notable changes to this project will be documented in this file.
   Add confirmation for overwrite import: `codex-helper config overwrite-from-codex` requires `--yes` to write; TUI Settings `O` needs a second press within 3s to confirm.
 - 运行态配置热加载：覆盖导入或手动修改配置文件后，无需重启，下一次请求会按新的 `active`/配置路由。  
   Runtime config hot reload: after overwrite import or manual edits, no restart needed—next request uses the updated `active`/routing config.
+- Settings 页增加运行态配置状态：展示最近一次加载时间与当前 retry 配置，支持 `R` 立即触发重载。  
+  Settings now shows runtime config status: last loaded time and current retry config, with `R` to trigger reload.
 
 ## [0.6.0] - 2025-12-29
 ### 亮点 / Highlights

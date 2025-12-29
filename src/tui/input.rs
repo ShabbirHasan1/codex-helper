@@ -552,6 +552,64 @@ async fn handle_key_normal(
                 }
             }
         }
+        KeyCode::Char('R') if ui.page == Page::Settings => {
+            let now = Instant::now();
+            let url = format!("http://127.0.0.1:{}/__codex_helper/config/reload", ui.port);
+            let res = async {
+                let client = reqwest::Client::new();
+                client
+                    .post(&url)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json::<serde_json::Value>()
+                    .await
+            }
+            .await;
+            match res {
+                Ok(v) => {
+                    let st = v.get("status");
+                    ui.last_runtime_config_loaded_at_ms = st
+                        .and_then(|x| x.get("loaded_at_ms"))
+                        .and_then(|x| x.as_u64());
+                    ui.last_runtime_config_source_mtime_ms = st
+                        .and_then(|x| x.get("source_mtime_ms"))
+                        .and_then(|x| x.as_u64());
+                    ui.last_runtime_retry = st
+                        .and_then(|x| x.get("retry"))
+                        .and_then(|x| serde_json::from_value(x.clone()).ok());
+                    ui.last_runtime_config_refresh_at = Some(now);
+
+                    let changed = v.get("reloaded").and_then(|x| x.as_bool()).unwrap_or(false);
+                    ui.toast = Some((
+                        crate::tui::i18n::pick(
+                            ui.language,
+                            format!(
+                                "已重载配置（{}）",
+                                if changed {
+                                    "检测到变更"
+                                } else {
+                                    "无变更"
+                                }
+                            )
+                            .as_str(),
+                            format!(
+                                "Config reloaded ({})",
+                                if changed { "changed" } else { "no change" }
+                            )
+                            .as_str(),
+                        )
+                        .to_string(),
+                        now,
+                    ));
+                    true
+                }
+                Err(err) => {
+                    ui.toast = Some((format!("reload failed: {err}"), now));
+                    true
+                }
+            }
+        }
         KeyCode::Char('i') if ui.page == Page::Configs => {
             ui.overlay = Overlay::ConfigInfo;
             ui.config_info_scroll = 0;
